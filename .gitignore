@@ -1,0 +1,29 @@
+# --- Environments ---
+.pixi/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# --- OS cruft ---
+.DS_Store
+
+# --- Large datasets (HDF5) ---
+*.h5
+hybrid_dataset_mpi/
+hybrid_dataset_all/
+
+# --- Model checkpoints / run artifacts ---
+*.pt
+*.pkl
+dirichlet_mdn_runs/
+
+# --- Copyrighted journal PDFs (do not redistribute) ---
+1-s2.0-*.pdf
+
+# --- Excluded PDFs ---
+Scatter.pdf
+Shashank_ML_PDF.pdf
+
+# --- Legacy baseline (excluded) ---
+EnsightPDFml.py
+MLPDF.py

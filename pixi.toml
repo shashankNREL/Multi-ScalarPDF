@@ -1,0 +1,180 @@
+[workspace]
+name = "multi-scalar-pdf"
+version = "0.1.0"
+description = "LES-filtered joint-PDF dataset generation (MPI) + Dirichlet Mixture Density Network"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+# ---------------------------------------------------------------------------
+[dependencies]
+python = "3.11.*"
+numpy = ">=1.26"
+scipy = ">=1.11"
+pandas = ">=2.1"
+pyarrow = ">=14"
+h5py = ">=3.10"
+scikit-learn = ">=1.3"
+joblib = ">=1.3"
+matplotlib-base = ">=3.8"
+pytorch = ">=2.2"
+tensorboard = ">=2.15"
+mpi4py = ">=3.1"
+openmpi = ">=4.1"
+tectonic = ">=0.15"
+
+# ---------------------------------------------------------------------------
+# Default knobs. Override on the command line, e.g.
+#   pixi run sample-mpi 52
+# ---------------------------------------------------------------------------
+[activation.env]
+DNS_ROOT = "."
+DATASET_TAG = "all_cases_w64_w128"
+SAMPLE_OUT = "hybrid_dataset_mpi"
+PARQUET = "hybrid_dataset_mpi/all_cases_w64_w128_metadata.parquet"
+HDF5_DIR = "hybrid_dataset_mpi"
+RUNS_DIR = "dirichlet_mdn_runs"
+
+# ---------------------------------------------------------------------------
+# Data sampling
+# ---------------------------------------------------------------------------
+
+[tasks.sample-mpi]
+description = "Phase 1 + Phase 2 of the MPI sampler. Usage: pixi run sample-mpi <nranks> [extra flags]"
+args = [{ arg = "nranks", default = "8" }]
+cmd = """
+mpirun -n {{ nranks }} python EnsightPDFHybridDatasetMPI.py \
+  --folder $DNS_ROOT \
+  --run-ids 0:27 \
+  --scalar-configs I1,I4,I5,L1,PI1,PI4,PI5,PL1 \
+  --box-widths 64,128 \
+  --strides 32,64 \
+  --tstart 17 --tend 30 \
+  --pdf-bins 64 --zst 0.1 \
+  --max-per-moment-bin 50 \
+  --moment-bins 12,12,12,12,12 \
+  --shape-threshold 0.03 \
+  --per-rank-cap-multiplier 2 \
+  --keep-rank-outputs \
+  --dataset-tag $DATASET_TAG \
+  --output-dir $SAMPLE_OUT
+"""
+
+[tasks.sample-mpi-smoke]
+description = "Tiny MPI sampling run (2 ranks, 2 runs, 1 timestep) to check the plumbing"
+cmd = """
+mpirun -n 2 python EnsightPDFHybridDatasetMPI.py \
+  --folder $DNS_ROOT \
+  --run-ids 0:2 \
+  --scalar-configs I1,L1 \
+  --box-widths 64 --strides 64 \
+  --tstart 17 --tend 18 \
+  --max-per-moment-bin 10 \
+  --keep-rank-outputs \
+  --dataset-tag smoke_w64 \
+  --output-dir hybrid_dataset_smoke
+"""
+
+[tasks.merge-only]
+description = "Re-run Phase 2 (the merge) over an existing _rank/ tree, no MPI needed"
+cmd = """
+python EnsightPDFHybridDatasetMPI.py \
+  --skip-phase1 \
+  --output-dir $SAMPLE_OUT \
+  --dataset-tag $DATASET_TAG \
+  --max-per-moment-bin 50 \
+  --moment-bins 12,12,12,12,12 \
+  --shape-threshold 0.03 \
+  --merge-progress-every 10000
+"""
+
+[tasks.sample-serial]
+description = "Single-process reference sampler (slow; use for small cases and cross-checks)"
+cmd = """
+python EnsightPDFHybridDataset.py \
+  --folder $DNS_ROOT \
+  --run-ids 0:27 \
+  --scalar-configs I1,I4,I5,L1,PI1,PI4,PI5,PL1 \
+  --box-widths 64,128 --strides 32,64 \
+  --tstart 17 --tend 30 \
+  --dataset-tag $DATASET_TAG \
+  --output-dir hybrid_dataset_all
+"""
+
+# ---------------------------------------------------------------------------
+# Dataset inspection
+# ---------------------------------------------------------------------------
+
+[tasks.verify]
+description = "Five self-checks: bin grid, gradients, moment algebra, permutation invariance, K=1 recovery"
+cmd = "python -m dirichlet_mdn.verify --parquet $PARQUET --hdf5-dir $HDF5_DIR"
+
+[tasks.diversity]
+description = "Audit dataset coverage: cell counts, moment percentiles, simplex coverage, plots"
+cmd = "python -m dirichlet_mdn.dataset_diversity --parquet $PARQUET --out-dir diagnostics/hybrid_dataset_mpi"
+
+[tasks.preview-split]
+description = "Build and report the train/val/test split without training anything"
+args = [{ arg = "seed", default = "0" }]
+cmd = "python -m dirichlet_mdn.preview_split --parquet $PARQUET --seed {{ seed }} --out-dir splits/by_run_id_seed{{ seed }}"
+
+# ---------------------------------------------------------------------------
+# Training and evaluation
+# ---------------------------------------------------------------------------
+
+[tasks.train]
+description = "Train the Dirichlet MDN. Usage: pixi run train <K> <input_moments> <epochs> <tag>"
+args = [
+  { arg = "k", default = "16" },
+  { arg = "moments", default = "5" },
+  { arg = "epochs", default = "500" },
+  { arg = "tag", default = "mdn" },
+]
+cmd = """
+python -m dirichlet_mdn.train \
+  --parquet $PARQUET \
+  --hdf5-dir $HDF5_DIR \
+  --input-moments {{ moments }} \
+  --K {{ k }} \
+  --hidden 256 \
+  --epochs {{ epochs }} \
+  --batch-size 64 \
+  --lr 3e-4 \
+  --lambda-mom 0.5 \
+  --lambda-ent 1e-3 \
+  --patience 30 \
+  --cache-histograms \
+  --flat-histograms \
+  --output-dir $RUNS_DIR \
+  --tag {{ tag }}
+"""
+
+[tasks.train-smoke]
+description = "2-epoch training run to confirm the loop works end to end"
+cmd = """
+python -m dirichlet_mdn.train \
+  --parquet $PARQUET --hdf5-dir $HDF5_DIR \
+  --input-moments 4 --K 4 --epochs 2 --batch-size 64 \
+  --output-dir $RUNS_DIR --tag smoke
+"""
+
+[tasks.evaluate]
+description = "Evaluate a finished run. Usage: pixi run evaluate <run_dir>"
+args = [{ arg = "run_dir" }]
+cmd = "python -m dirichlet_mdn.evaluate --run-dir {{ run_dir }}"
+
+[tasks.tensorboard]
+description = "Open TensorBoard on all training runs"
+cmd = "tensorboard --logdir $RUNS_DIR"
+
+# ---------------------------------------------------------------------------
+# Documentation
+# ---------------------------------------------------------------------------
+
+[tasks.doc]
+description = "Compile the plain-English guide with tectonic"
+cmd = "tectonic docs/mdn_and_sampling_explained.tex --keep-logs --outdir docs"
+
+[tasks.doc-clean]
+cmd = "rm -f docs/mdn_and_sampling_explained.pdf docs/mdn_and_sampling_explained.log"
