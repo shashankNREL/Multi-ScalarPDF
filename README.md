@@ -38,7 +38,6 @@ maximum likelihood with auxiliary moment-consistency and entropy terms. Design i
 ```
 EnsightPDFHybridDatasetMPI.py   MPI sampler (Phase 1 per-rank sampling + Phase 2 merge)
 EnsightPDFHybridDataset.py      Single-process reference sampler (slow; cross-checks)
-MLPDF.py, EnsightPDFml.py       Legacy pixel-wise softmax DNN baseline
 
 dirichlet_mdn/                  The model package
   model.py          DirichletMDN architecture
