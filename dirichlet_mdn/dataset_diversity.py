@@ -7,7 +7,7 @@ Standalone CLI that audits a parquet metadata file *before* training:
   - per-config moment distributions
   - retain_reason breakdown (the diversity policy that built this dataset)
   - shape diagnostic distributions (edge/corner/center mass, effective support)
-  - variance regime per config (near-deterministic vs well-mixed)
+  - variance regime per config (well-mixed vs highly segregated)
   - sample histograms drawn from a few records, for visual sanity check
 
 Reports go under ``<out-dir>/`` as:
@@ -111,7 +111,7 @@ def simplex_coverage(
     mask = np.zeros_like(H, dtype=bool)
     for i in range(nb):
         for j in range(nb):
-            if xb[i] + yb[j] <= 1.0:
+            if xb[i] + yb[j] < 1.0:
                 mask[i, j] = True
     n_filled = int((H[mask] > 0).sum())
     n_cells = int(mask.sum())
@@ -132,7 +132,7 @@ def per_config_simplex_coverage(df: pd.DataFrame, nb: int = 20) -> dict:
     mask = np.zeros((nb, nb), dtype=bool)
     for i in range(nb):
         for j in range(nb):
-            if xb[i] + yb[j] <= 1.0:
+            if xb[i] + yb[j] < 1.0:
                 mask[i, j] = True
     out = {}
     for cfg, sub in df.groupby("scalar_config"):
@@ -154,10 +154,16 @@ def variance_regime(df: pd.DataFrame) -> dict:
     for cfg, sub in df.groupby("scalar_config"):
         max_var = sub["mean_a"] * (1.0 - sub["mean_a"])
         rel = (sub["var_a"] / max_var.replace(0, np.nan)).clip(0, 1)
+        valid = rel.dropna()
         out[cfg] = {
-            "frac_near_deterministic_lt_0_1": float((rel < 0.1).mean()),
-            "frac_well_mixed_gt_0_8": float((rel > 0.8).mean()),
-            "median_rel_var_a": float(rel.median()),
+            "frac_well_mixed_lt_0_1": (
+                float((valid < 0.1).mean()) if len(valid) else None
+            ),
+            "frac_highly_segregated_gt_0_8": (
+                float((valid > 0.8).mean()) if len(valid) else None
+            ),
+            "median_rel_var_a": float(valid.median()) if len(valid) else None,
+            "n_undefined_at_bound_mean": int(rel.isna().sum()),
         }
     return out
 
@@ -215,7 +221,7 @@ def plot_simplex_coverage(df: pd.DataFrame, out_path: Path, nb: int = 20) -> Non
     mask = np.zeros((nb, nb), dtype=bool)
     for i in range(nb):
         for j in range(nb):
-            if xb[i] + yb[j] <= 1.0:
+            if xb[i] + yb[j] < 1.0:
                 mask[i, j] = True
 
     # (0) global heatmap
@@ -368,9 +374,21 @@ def plot_sample_pdfs(
                 if shard not in handles:
                     handles[shard] = h5py.File(str(hdf5_dir / shard), "r")
                 hist = np.asarray(handles[shard]["data/histograms"][int(row["local_index"])])
-                show = np.where(grid.simplex_mask, hist, np.nan).T
+                density = np.divide(
+                    hist,
+                    grid.cell_area,
+                    out=np.full_like(hist, np.nan, dtype=np.float64),
+                    where=grid.simplex_mask,
+                )
+                show = np.where(grid.simplex_mask, density, np.nan).T
                 ax = axes[i, j]
-                ax.imshow(show, origin="lower", extent=[0, 1, 0, 1], aspect="equal", cmap="magma")
+                ax.pcolormesh(
+                    grid.edges_a, grid.edges_b, show,
+                    shading="flat", cmap="magma",
+                )
+                ax.set_xlim(0, 1)
+                ax.set_ylim(0, 1)
+                ax.set_aspect("equal")
                 ax.plot([0, 1, 0, 0], [0, 0, 1, 0], "w-", linewidth=0.8)
                 ax.set_xticks([]); ax.set_yticks([])
                 ax.set_title(
@@ -383,7 +401,7 @@ def plot_sample_pdfs(
         for h in handles.values():
             try: h.close()
             except Exception: pass
-    fig.suptitle("Random DNS PDF samples per scalar_config")
+    fig.suptitle("Random DNS PDF density samples per scalar_config")
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -413,6 +431,17 @@ def run(
     per_cfg_cov = per_config_simplex_coverage(df, nb=grid_size)
     var_regime = variance_regime(df)
     edge = edge_concentration(df)
+    if "moment_abs_err_max" in df:
+        moment_discrepancy = {
+            "maximum": float(df["moment_abs_err_max"].max()),
+            "median": float(df["moment_abs_err_max"].median()),
+            "p99": float(df["moment_abs_err_max"].quantile(0.99)),
+            "per_config_maximum": (
+                df.groupby("scalar_config")["moment_abs_err_max"].max().to_dict()
+            ),
+        }
+    else:
+        moment_discrepancy = {"available": False}
 
     summary = {
         "parquet": str(parquet),
@@ -427,6 +456,7 @@ def run(
         "per_config_simplex_coverage": per_cfg_cov,
         "variance_regime_per_config": var_regime,
         "edge_concentration": edge,
+        "direct_vs_histogram_moment_discrepancy": moment_discrepancy,
         "retain_reason_counts": df["retain_reason"].value_counts().to_dict(),
         "records_per_timestep": df.groupby("timestep").size().to_dict(),
     }

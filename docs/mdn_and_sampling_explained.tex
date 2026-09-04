@@ -215,13 +215,12 @@ Mathematicians call this triangle the \term{2-simplex}. You do not need that wor
 will see it in the code (\code{simplex\_mask}, \code{z\_simplex}, \code{num\_simplex\_cells}),
 so it is worth knowing that ``simplex'' simply means ``the triangle of allowed values''.
 The upper-right half of the square, where $z_1 + z_2 > 1$, is physically impossible: it
-would mean the two ingredients together add up to more than the whole. The code carries
-a boolean grid called \code{simplex\_mask} that is \code{True} exactly on the allowed
-triangle and \code{False} outside it; it is built in
-\Grid{75}{bin\_grid} and in \Mpi{177}{get\_histogram\_layout}, both with the same
-one-line test \MpiL{200}: \code{(grid\_a + grid\_b) <= 1.0 + 1.0e-12}.
-(The tiny \code{1e-12} is slack so that points sitting exactly on the edge are not thrown
-away because of rounding.)
+would mean the two ingredients together add up to more than the whole. A rectangular
+histogram cell can straddle the diagonal boundary: part of it is allowed and part is not.
+The code therefore clips every rectangle against the triangle.  The boolean array
+\code{simplex\_mask} is true whenever the clipped piece has positive area.  It does
+\emph{not} merely test the rectangle's centre.  This distinction prevents valid
+boundary-adjacent cells from disappearing.
 
 \section{Two levels of detail: fine and coarse}
 
@@ -303,9 +302,9 @@ simulation output into a curated training set. The word \term{MPI} in the filena
 program can run on many CPU cores --- even many separate computers --- at the same time.
 We will unpack that in Chapter~\ref{ch:mpi}.
 
-The whole file is self-contained by design; its opening comment
-\MpiL{1} explicitly notes that it deliberately does \emph{not} import the single-process
-version, so the two scripts can evolve independently.
+This is the canonical implementation. The shorter
+\code{EnsightPDFHybridDataset.py} imports and calls it with one MPI rank, so serial and
+parallel runs cannot quietly drift into two different algorithms.
 
 \section{The nine stages}
 
@@ -323,8 +322,8 @@ version, so the two scripts can evolve independently.
 \node[box, below=of c] (d) {\textbf{4. Summarise} the values inside the window into five numbers (the moments).};
 \node[box, below=of d] (e) {\textbf{5. Bin} the values into a $64\times64$ histogram over the triangle.};
 \node[box, below=of e] (f) {\textbf{6. Describe} the histogram's shape with ten extra descriptors.};
-\node[box, below=of f] (g) {\textbf{7. Decide} whether this example is worth keeping, or is a near-duplicate.};
-\node[box, below=of g] (h) {\textbf{8. Merge} the per-processor selections into one globally balanced set.};
+\node[box, below=of f] (g) {\textbf{7. Save every candidate} in a per-processor Phase-1 dataset.};
+\node[box, below=of g] (h) {\textbf{8. Merge and select} once, globally, in a seeded deterministic order.};
 \node[box, below=of h] (i) {\textbf{9. Write} the survivors to disk as HDF5 + Parquet + a JSON manifest.};
 \draw[arrow] (a) -- (b);
 \draw[arrow] (b) -- (c);
@@ -599,8 +598,19 @@ the metadata by that column and look at the worst offenders.
 \begin{caution}
 The neural network is trained on the \emph{direct} moments (the raw-value ones), not the
 histogram ones. This is a deliberate choice: at deployment time an LES solver would supply
-true moments, not histogram-derived ones. The histogram moments exist purely as a diagnostic.
+true moments, not histogram-derived ones. The histogram moments measure information lost by
+binning. Their maximum disagreement is also an input-quality gate: training stops if it exceeds
+the configured tolerance.
 \end{caution}
+
+\begin{plainbox}{Reading the variance-regime diagnostic correctly}
+For a scalar between 0 and 1 with mean $m$, the largest possible variance is $m(1-m)$.
+The diagnostic plots the ratio $\mathrm{variance}/[m(1-m)]$. A ratio near zero means values
+are clustered near their mean: the well-mixed limit. A ratio near one means values are split
+toward extremes: a highly segregated limit. Earlier labels reversed these meanings; the code
+now reports \code{well\_mixed\_lt\_0\_1} and
+\code{highly\_segregated\_gt\_0\_8}.
+\end{plainbox}
 
 % ===================================================================
 \chapter{Stage 5: Building the Histogram}
@@ -663,16 +673,15 @@ If you pass \code{--uniform-bins}, the whole construction is skipped and
   \item \textbf{Edges.} Interior edges sit halfway between neighbouring centres,
         $e_i = \tfrac{1}{2}(z_i + z_{i-1})$. The two outermost edges are extrapolated by
         reflecting the first and last half-gaps. There are $N+1 = 65$ edges for $N = 64$ bins.
-  \item \textbf{Cell areas.} Because the bins are unequal, each little rectangle in the
-        $64\times64$ grid has its own area, $A_{ij} = (e^a_{i+1} - e^a_i)(e^b_{j+1} - e^b_j)$.
-        These areas matter enormously later, when we convert between a \emph{probability}
-        (a fraction of dots in a square) and a \emph{density} (probability per unit area).
-  \item \textbf{Grids.} \code{grid\_a} and \code{grid\_b} are $64\times64$ arrays holding the
-        $z_1$ and $z_2$ coordinate of every cell centre, produced by \code{np.meshgrid} with
-        \code{indexing="ij"} --- meaning row index $\to z_1$, column index $\to z_2$. Keeping
-        this convention straight is essential; the training code re-derives it in
-        \Grid{75}{bin\_grid} and checks the two agree.
-  \item \textbf{Simplex mask.} The boolean triangle described in Chapter~1.
+  \item \textbf{Clipped cell areas.} Each rectangle is cut at $z_1=0$, $z_2=0$, and
+        $z_1+z_2=1$.  \code{cell\_area} stores the area of the surviving polygon, not the
+        whole rectangle.  All stored areas add to $1/2$, the exact area of the unit triangle.
+        Areas matter when converting a cell's probability into probability per unit area.
+  \item \textbf{Clipped centroids.} \code{cell\_centroid\_a} and
+        \code{cell\_centroid\_b} store the balance point of each surviving polygon.  The
+        likelihood evaluates density there.  A boundary cell's centroid is inside the
+        triangle even when its original rectangular centre was outside.
+  \item \textbf{Simplex mask.} This is true precisely where clipped area is positive.
 \end{itemize}
 
 Of the 4096 cells in the grid, only about 2200 fall inside the triangle. Everything
@@ -688,9 +697,18 @@ in-triangle cells.
         using the edge arrays computed above. \code{density=False} means give raw counts.
   \item If the total count is zero the function raises an error --- a guard against
         empty or corrupted windows.
-  \item Divide by the total \MpiL{234}. The result is a table of fractions that sums to
+  \item Verify that the histogram counted every validated pair.  A mismatch is an error,
+        rather than silently dropping samples outside the bin edges.
+  \item Divide by the total. The result is a table of fractions that sums to
         exactly 1.
 \end{enumerate}
+
+Before counting, \code{prepare\_scalar\_samples} checks that both scalar arrays have the
+same size, every number is finite, each scalar lies in $[0,1]$, and the pair obeys
+$z_1+z_2\leq1$. Tiny round-off errors within \code{--scalar-tolerance} are clipped or
+projected back to the boundary. Larger errors either stop the run (the default) or are
+explicitly dropped by \code{--invalid-scalar-policy drop}. Raw, invalid, adjusted, and
+used pair counts are written to the manifest, so this cleaning cannot be hidden.
 
 \begin{caution}
 The stored quantity is a \emph{probability mass} per cell, not a probability \emph{density}.
@@ -701,8 +719,10 @@ training code is careful about this: see the \code{log\_cell\_area} buffer in
 \end{caution}
 
 The histogram is converted to 32-bit floats before being yielded, halving its memory
-footprint. At $64\times64$ that is 16~kB per example; 825{,}000 candidates would be about
-13~GB, which is why Phase~1 stores them to disk rather than holding them all in RAM.
+footprint. At $64\times64$ that is 16~kB per example. The corrected Phase~1 is lossless,
+but the present implementation still buffers one rank's candidates before writing them.
+That choice protects selection correctness at the cost of potentially high memory use;
+large runs must be sized conservatively until rank output is made incremental.
 
 % ===================================================================
 \chapter{Stage 6: Describing the Shape of a Histogram}
@@ -927,9 +947,10 @@ the most redundant occupant. This makes the final contents much less dependent o
 order than a simple first-come-first-served cap would be.
 
 \begin{caution}
-The algorithm is \emph{greedy} and therefore order-dependent. Running with a different number
-of MPI ranks changes the order in which candidates reach the merge, which can change the final
-selection slightly. The dataset is reproducible for a fixed rank count, not across rank counts.
+The algorithm is still \emph{greedy}, so some order must be chosen.  The corrected code hashes
+each candidate's physical identity together with \code{--selection-seed}, then processes hashes
+in sorted order.  The same candidates and seed therefore give the same order for one rank or
+many ranks.  Changing the seed is useful for measuring how sensitive selection is to order.
 \end{caution}
 
 \section{Bookkeeping when a replacement happens}
@@ -966,18 +987,18 @@ The obvious fix is to give each processor a slice of the work. But the retention
 \emph{stateful}: whether to keep example number 900{,}000 depends on the 899{,}999 decisions
 before it. That is exactly what does not parallelise.
 
-The program's answer is a two-phase design, spelled out in its opening comment \MpiL{14}:
-run the greedy algorithm independently on each processor with a \emph{deliberately loosened}
-cap, then replay all the survivors through the same algorithm one final time with the real cap.
+The program's answer is a two-phase design. Phase~1 performs expensive DNS reading and
+histogram construction in parallel, but does \emph{no local pruning}. Phase~2 replays every
+candidate through one global retention decision. This is essential: once a processor discards
+a candidate locally, no later global merge can recover it.
 
 \begin{analogy}
-Fifty judges each screen their own pile of audition tapes and forward their top hundred.
-A single head judge then watches only those forwarded tapes and picks the final fifty per
-category. The head judge's decisions are consistent, but they only had to watch a small
-fraction of the original material.
+Fifty assistants digitise separate piles of audition tapes, but discard none. A single head
+judge then receives the complete catalogue in a fixed order and chooses the final set. Changing
+the number of assistants changes who digitises a tape, not what the judge sees.
 \end{analogy}
 
-\section{Phase 1: independent greedy selection}
+\section{Phase 1: lossless parallel extraction}
 
 \subsection*{Splitting up the work}
 
@@ -1003,29 +1024,20 @@ idle; they will still write an empty manifest so the merge knows they ran
 \MpiL{782}.
 \end{caution}
 
-\subsection*{The inflated cap}
+\subsection*{Why there is no local cap}
 
-Each processor runs the ordinary greedy algorithm over its slice, but with a per-drawer cap of
-\[
-  \texttt{per\_rank\_cap} = \texttt{max\_per\_moment\_bin} \times \texttt{per\_rank\_cap\_multiplier}
-\]
-computed at \MpiL{1100}, with a floor of 1. The default multiplier is 2, so each processor
-keeps up to 100 per drawer instead of 50.
-
-The reason is a subtle statistical one. If each processor kept only 50 per drawer, then for a
-drawer where processor~7 happens to hold all the world's best candidates, the merge would only
-ever see 50 of them --- and processors 0--6 would each contribute 50 mediocre ones that crowd
-the drawer. Over-collecting gives the final merge a richer pool to choose from. The trade-off
-is disk space and merge time; the option is documented as ``1=tightest, 2=safe, 3=loose''
-\MpiL{619}.
+Every validated window becomes a Phase-1 candidate. The old
+\code{--per-rank-cap-multiplier} option remains only so old command lines do not fail; it no
+longer controls selection. This uses more disk and memory, but makes the global result accurate
+and independent of how work happened to be divided among processors.
 
 \subsection*{What each processor writes}
 
-\Mpi{766}{write\_rank\_outputs} saves the processor's survivors under
+\Mpi{893}{write\_rank\_outputs} saves the processor's complete candidate set under
 \code{<output-dir>/\_rank/rank\_NNNN/}, using the same writer as the final dataset
-(\Mpi{533}{materialize\_dataset}) so the format is identical. It adds three extra fields to
-the per-rank manifest: the processor's rank number, the list of work units it handled, and
-the cap it used.
+so the format is identical. Its manifest records the processor number, assigned work units,
+full extraction configuration, a SHA-256 configuration signature, and that extraction was
+lossless.
 
 The empty-result branch \MpiL{782} is important: even a processor that retained nothing writes
 a manifest, so that Phase~2 can tell ``ran and found nothing'' apart from ``crashed''.
@@ -1050,26 +1062,19 @@ all of them have arrived. It guarantees that all per-rank files are completely w
 the merge starts reading them. Immediately after the barrier, every processor except rank~0
 simply returns and exits \MpiL{1166}.
 
-\section{Phase 2: the single-processor merge}
+\section{Phase 2: checked, deterministic global merge}
 
-Only rank~0 continues. It globs the \code{rank\_*} directories in sorted order \MpiL{1179},
-so the merge order is deterministic for a given rank count.
+Only rank~0 continues. Before reading a histogram, it checks that rank directories are
+contiguous, every rank manifest exists, every expected work unit appears exactly once, counts
+say that no candidate was lost, file format versions agree, and every configuration signature
+matches the current command. Stale, partial, extra, or incompatible output stops with an error.
 
 \subsection*{Streaming the candidates back in}
 
-\Mpi{831}{iter\_rank\_candidates} is a generator that yields
-\code{(metadata, histogram)} pairs from every processor's output in turn. It is written for
-speed, and the docstring names the two things it deliberately avoids:
-
-\begin{itemize}
-  \item \textbf{No \code{pandas.iterrows()}.} That method rebuilds a Series object for every
-        row and is notoriously slow. Instead the metadata is converted once, in bulk, with
-        \code{to\_dict(orient="records")} \MpiL{876}, producing plain Python dictionaries.
-  \item \textbf{No per-candidate HDF5 reads.} Each compressed shard is decompressed once into
-        memory as a whole array \MpiL{871}, then indexed cheaply. Reading one histogram at a
-        time from a gzip-compressed file would decompress the surrounding chunk every single
-        time.
-\end{itemize}
+\Mpi{1036}{iter\_rank\_candidates} first sorts each rank by the seeded SHA-256 key described
+above. A small heap performs a \term{k-way merge}: it holds only the next candidate from each
+rank and repeatedly takes the smallest key. This produces one global order without loading
+all histograms on rank~0, and that order does not depend on the MPI rank count.
 
 It also does some hygiene: it drops the per-rank bookkeeping columns
 (\code{sample\_id}, \code{shard\_id}, \code{local\_index}, \code{hdf5\_file}) which are about
@@ -1077,6 +1082,11 @@ to be regenerated, and it drops the \emph{stale} decision columns from Phase~1
 (\code{moment\_bin\_*}, \code{shape\_novelty}, \code{retain\_reason}) \MpiL{842}, because the
 merge is about to recompute all of them under the global cap. Without that, the final dataset
 would carry misleading provenance.
+
+For every source (configuration, run, timestep, and filter width), the final metadata also
+records how many candidates existed, how many survived, the retained fraction, and its inverse.
+Evaluation can use that inverse retention weight to report a source-weighted result instead of
+letting heavily retained sources dominate silently.
 
 \subsection*{Replaying the decision with the real cap}
 
@@ -1305,10 +1315,11 @@ You can read off the behaviour without any calculus:
 \midrule
 All three $\alpha_i$ equal to 1 & Perfectly flat: every point in the triangle equally likely. \\[3pt]
 All three large and equal & A tight blob at the centre. The larger they are, the tighter. \\[3pt]
-All three below 1 & Mass flees to the corners --- the distribution describes an
-                    \emph{unmixed} state. \\[3pt]
-One large, two small & A blob near the corresponding corner. \\[3pt]
-Two moderate, one tiny & Mass stretched along one edge. \\
+Any value below 1 & The mathematical density becomes infinite on part of the boundary.
+                    The current code deliberately forbids this case. \\[3pt]
+One much larger than the others & A blob biased toward the corresponding corner. \\[3pt]
+Two moderate, one equal to 1 & Density can extend to the corresponding edge, but it is
+                               still continuous rather than a point mass. \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -1344,12 +1355,13 @@ The fix is to add several together, each with its own weight:
   \qquad \pi_k \ge 0, \qquad \sum_{k=1}^{K} \pi_k = 1 .
 \]
 With $K = 16$ components you have $16 \times 3 = 48$ concentration numbers plus 16 weights,
-64 numbers in total --- still 35 times fewer than the 2200 histogram cells, but flexible
-enough to represent essentially any shape that appears in the data.
+64 numbers in total --- still far fewer than the histogram cells. This gives useful
+flexibility, but it is not a guarantee of representing every observed shape.
 
 \begin{analogy}
 A single Dirichlet is one spotlight on a stage. A mixture is sixteen spotlights, each with
-its own position, spread, and brightness. Together they can light up any pattern you like.
+its own position, spread, and brightness. Together they can make more patterns, but a finite
+set of ordinary spotlights cannot create an infinitely sharp line or point.
 \end{analogy}
 
 % ===================================================================
@@ -1423,9 +1435,10 @@ $\mathrm{softplus}(x) = \log(1 + e^x)$, a smooth function that is always positiv
 approaches $x$ for large $x$. Then:
 
 \begin{itemize}
-  \item A floor \code{alpha\_min} (default $10^{-3}$) is \emph{added}. Softplus can return
-        values arbitrarily close to zero, and $\alpha$ near zero makes the log-density
-        explode. The floor keeps the arithmetic finite.
+  \item A floor \code{alpha\_min} (default $1$) is added. Values below 1 create infinite
+        density at an edge or corner. Because this implementation estimates each cell's
+        mass from one density value at its centroid, it cannot integrate those singularities
+        reliably. The constructor therefore rejects any floor below 1.
   \item A ceiling \code{alpha\_clip} (default $10^{3}$) is applied with \code{clamp}. Very
         large $\alpha$ means an extremely narrow spike, which produces enormous gradients and
         destabilises training.
@@ -1434,7 +1447,14 @@ approaches $x$ for large $x$. Then:
 \end{itemize}
 
 The constructor also validates its arguments up front \ModelL{32}: \code{n\_in} must be 4 or 5,
-$K$ must be at least 1, and the ceiling must exceed the floor.
+$K$ must be at least 1, the hidden width must be positive, the floor must be at least 1, and
+the ceiling must exceed the floor.
+
+\begin{caution}
+This restriction is honest but important. The model cannot exactly represent a delta function,
+an atom at a pure-stream corner, or probability living only on an edge. It can approximate
+some narrow \emph{interior} peaks up to \code{alpha\_clip}, and those errors must be measured.
+\end{caution}
 
 \section{Size}
 
@@ -1478,9 +1498,9 @@ Everything that does not change from batch to batch is computed once when the mo
 created \LossL{85}:
 
 \begin{enumerate}
-  \item Flatten the $64\times64$ grid and keep only the in-triangle cells, giving $M \approx 2200$
-        points. Store their coordinates as \code{z\_simplex} of shape $(M, 3)$, with the third
-        coordinate reconstructed as $z_3 = 1 - z_1 - z_2$, clamped at zero.
+  \item Flatten the $64\times64$ grid and keep only cells with positive clipped area. Store
+        each clipped polygon's centroid as \code{z\_simplex} of shape $(M, 3)$, with
+        $z_3 = 1-z_1-z_2$.
   \item Store the cell areas of those $M$ cells, and their logarithms as \code{log\_cell\_area}.
   \item Store $\log$ of the normalised coordinates as \code{log\_z\_norm}, pre-shaped to
         $(1, M, 1, 3)$ so it can be broadcast against $\alpha$ without any reshaping at
@@ -1517,9 +1537,12 @@ For a batch of $B$ examples \LossL{132}:
         \code{log\_cell\_area}.
   \item \textbf{Renormalise over the triangle.} Subtract another \code{logsumexp}, this time
         over the cells. This is the crucial step: the true histogram sums to 1 over the
-        triangle, so the prediction must too, even though a Dirichlet formally spreads a little
-        mass outside the discretised region.
-  \item \textbf{The surprise.} Multiply the true histogram by the predicted log-probabilities,
+        triangle, so the prediction must too. Density-at-centroid times area is numerical
+        quadrature, not an exact cell integral, so its raw sum is not exactly one.
+  \item \textbf{Validate the target.} Reject non-finite values, negative values, zero total
+        mass, or mass outside the clipped simplex. Then divide by the in-simplex total. This
+        guarantees that every record contributes a normalized categorical target.
+  \item \textbf{The surprise.} Multiply the normalized true histogram by the predicted log-probabilities,
         sum, and negate:
         \[
           L_{\text{nll}} = -\frac{1}{B}\sum_{b=1}^{B}\sum_{m=1}^{M} p_{b,m} \log q_{b,m} .
@@ -1539,11 +1562,11 @@ $(B, M)$ one \LossL{148}, deciding by checking the tensor's shape. If you pass
 \code{--flat-histograms} on the training command line, the dataset does the flattening once
 at load time \DataL{182} and the loss skips a reshape-and-gather on every single batch.
 
-\section{Part 2: matching the moments exactly}
+\section{Part 2: encouraging the moments to match}
 
 The histogram loss cares about the whole picture. But we also want the prediction's mean and
-variance to agree with the numbers we fed in --- because in deployment those numbers are hard
-constraints from the physics solver.
+variance to agree with the numbers we fed in. The loss encourages agreement, but does not solve
+an equation that forces exact agreement.
 
 The wonderful thing about a Dirichlet mixture is that its moments can be computed by algebra,
 with no sampling and no integration. \Loss{165}{mixture\_moments} does it in nine lines.
@@ -1580,12 +1603,25 @@ than either group's own spread, because you must also account for the gap betwee
 gap is the $-(\mathbb{E}[Z])^2$ correction.
 \end{analogy}
 
-\Loss{190}{stack\_predicted\_moments} arranges these into the same order as the input vector
+\Loss{206}{stack\_predicted\_moments} arranges these into the same order as the input vector
 --- $[\mathbb{E}_1, V_1, \mathbb{E}_2, V_2]$ for the four-moment setting, with
-$\mathrm{Cov}_{12}$ appended for five --- and \Loss{206}{moment\_loss} takes the mean squared
-difference against the true moments.
+$\mathrm{Cov}_{12}$ appended for five. Before squaring errors, \code{moment\_loss} divides
+mean errors by 1 and variance/covariance errors by 0.25, their natural physical ranges:
+\[
+  L_{\rm mom} = \operatorname{mean}_j
+  \left(\frac{\widehat m_j-m_j}{s_j}\right)^2,\qquad
+  s=[1,0.25,1,0.25,0.25].
+\]
+This makes the errors dimensionless, so the smaller-valued variances and covariance are not
+ignored merely because of their numerical scale.
 
 This term is weighted by \code{--lambda-mom} (default 0.5).
+
+\begin{caution}
+The moments can be computed exactly \emph{from the predicted parameters}; this does not mean
+they equal the conditioning moments exactly. Evaluation reports absolute and relative errors.
+A solver should not use a model whose measured errors exceed its physical tolerance.
+\end{caution}
 
 \begin{caution}
 Note carefully that the moment loss compares against the \emph{unscaled} moments, while the
@@ -1645,15 +1681,27 @@ raising a clear error listing exactly which are missing if not.
 
 \subsection*{A safety check you should not skip}
 
-On construction, \Data{115}{\_check\_grid\_matches\_first\_shard} rebuilds the bin grid from
+On construction, the dataset rebuilds the bin grid from
 scratch using \Grid{75}{bin\_grid} and compares it against the \code{/bins} group actually
-stored in the first HDF5 shard, demanding agreement to $10^{-9}$
-(\Grid{107}{validate\_against\_hdf5}).
+stored in a shard, including clipped areas, clipped centroids, and the mask.
 
 This matters because the training code re-derives the grid from three numbers
 (\code{--num-bins}, \code{--zst}, \code{--uniform-bins}) rather than reading it from the file.
 If you train with the wrong $z_{\text{st}}$, every histogram would be silently misinterpreted
 and the results would be quietly wrong. The check turns a silent disaster into a loud crash.
+
+Training additionally runs \code{validate\_dataset} over \emph{every} shard and record before
+the first epoch. It checks file presence, shapes, finite non-negative masses, normalization,
+zero mass outside the simplex, one-to-one Parquet-to-HDF5 row mappings, stored sample IDs, and
+the difference between moments computed from raw DNS values and from histograms. The default
+maximum allowed moment discrepancy is 0.05. A JSON copy of the validation result is saved in
+the run directory.
+
+\begin{caution}
+Files generated by the old centre-masked writer do not contain clipped centroids and use a
+different meaning for cell area. The validator rejects them. They must be regenerated; silently
+``upgrading'' only their metadata would not restore probability mass already discarded.
+\end{caution}
 
 \subsection*{Fetching one example}
 
@@ -1664,9 +1712,7 @@ and the results would be quietly wrong. The check turns a silent disaster into a
   \item Open the shard lazily. Handles are cached in a dictionary \DataL{136}, so the file is
         opened at most once even across hundreds of thousands of reads.
   \item Read the histogram.
-  \item \textbf{Verify it sums to 1}, but only for the first read from each shard
-        \DataL{171}. A full check on every read would be pure overhead; a check once per file
-        catches a corrupted or wrongly-normalised shard immediately.
+  \item Verify every fetched histogram is finite, non-negative, and sums to 1.
   \item Optionally flatten to in-triangle cells; optionally store in a RAM cache.
   \item Assemble the 4- or 5-element moment vector and the metadata dictionary.
 \end{enumerate}
@@ -1699,39 +1745,30 @@ training and its near-twin in testing. Your test score would be excellent and co
 meaningless, because you would only have proved that the network can recognise things it has
 already seen.
 
-\subsection*{The fix: split by simulation run}
+\subsection*{The fix: one global split by simulation run}
 
-\Split{80}{make\_split} splits by \code{run\_id}, not by row. All examples from run~7 go
+\code{make\_split} splits by \code{run\_id}, not by row. All examples from run~7 go
 entirely into training, or entirely into validation, or entirely into testing. Since different
 runs start from different random initial conditions, a test run is genuinely unseen physics.
 
-The procedure, per scalar configuration:
+The run list is shuffled once with a recorded seed and partitioned once for the whole dataset.
+It is \emph{not} partitioned separately for each scalar configuration, because those
+configurations can share the same underlying velocity realization.
 
 \begin{itemize}
-  \item If the configuration has at least three distinct runs, \Split{35}{\_split\_runs}
-        shuffles the run list with a seeded generator and slices it 70/15/15 by default.
-        Seeding means the same seed always produces the same split, so results are reproducible.
-  \item If it has fewer than three runs, a run-based split is impossible. The fallback is
-        chosen by \code{--split-fallback}:
-        \begin{itemize}
-          \item \code{timestep} (default) uses \Split{57}{\_split\_timesteps} to cut the
-                timesteps into three \emph{contiguous, non-shuffled} blocks --- early ones for
-                training, later ones for validation and testing. Contiguity matters: turbulence
-                evolves smoothly, so interleaving timesteps would leak information forwards
-                and backwards in time.
-          \item \code{train\_only} puts everything into training and leaves that configuration
-                out of validation and testing entirely.
-        \end{itemize}
+  \item Default ratios are 70/15/15. Requested zero ratios remain exactly zero. With too few
+        runs to populate every nonzero partition, a partition may be empty; the code never
+        falls back to splitting one run by timestep.
   \item If \code{--holdout-config} names a configuration, that entire configuration becomes the
         test set and everything else is split 80/20 between training and validation. This is
-        the harshest and most informative test: can the model generalise to an initial
-        condition it has never encountered?
+        specifically a configuration-generalization test.
 \end{itemize}
 
-Whatever route is taken, the \code{description} dictionary records the mode used per
-configuration, the number of runs, the number of rows, and the exact run or timestep lists.
-That record is saved alongside the model, so months later you can prove which runs the model
-never saw.
+The saved split includes exact indices, run lists, grouping policy, and a SHA-256 fingerprint
+of the ordered metadata. Loading checks that indices are unique, in range, mutually disjoint,
+cover every row exactly once, obey holdout rules, and match the current dataset fingerprint.
+Thus a split file from a different Parquet dataset is rejected even if its row count happens
+to match.
 
 You can inspect a split before committing to it with
 \code{python -m dirichlet\_mdn.preview\_split}, which writes a Markdown table and a CSV
@@ -1747,9 +1784,10 @@ summary; see \code{splits/by\_run\_id\_seed0/} in this workspace for an example.
 
 \begin{enumerate}
   \item Seed every random number generator so the run is reproducible.
-  \item Create a run directory named with a timestamp and the \code{--tag} you supplied, so
-        runs never overwrite each other.
-  \item Load the metadata and either build a split or load a pre-computed one from
+  \item Create a run directory named with a UTC timestamp down to microseconds, your
+        \code{--tag}, and a random suffix. Existing directories are never reused.
+  \item Load and exhaustively validate the dataset.
+  \item Either build a split or load and verify a pre-computed one from
         \code{--splits-json}.
   \item \textbf{Fit the input scaler} \TrainL{265} on the \emph{training rows only}.
   \item Build the model, the loss module, and the data loaders.
@@ -1776,7 +1814,9 @@ replacing any scale below $10^{-6}$ with 1.0 \TrainL{114}.
 \begin{caution}
 The scaler is fitted on training rows only, then applied unchanged to validation and test rows.
 Fitting on the full dataset would leak information about the test distribution into training.
-The fitted scaler is saved to \code{scaler.pkl} and must accompany the model at deployment.
+The exact centre and effective scale used by PyTorch are saved in
+\code{input\_transform.json}. Evaluation loads that language-independent file. The older
+\code{scaler.pkl} is retained for inspection, but is not the deployment contract.
 \end{caution}
 
 \section{The optimiser and the schedule}
@@ -1818,10 +1858,10 @@ After the batches, step the learning-rate schedule and run
 \section{Choosing when to stop}
 
 \begin{itemize}
-  \item \textbf{Best-model tracking.} If the validation negative-log-likelihood improves,
-        the checkpoint \code{model\_best.pt} is rewritten \TrainL{409}. Note the criterion is
-        the NLL term alone, not the combined total --- fitting the shape of the distribution is
-        the primary objective.
+  \item \textbf{Best-model tracking.} By default, if the full validation loss improves,
+        \code{model\_best.pt} is rewritten. This matches the objective actually optimized,
+        including moment and entropy terms. \code{--selection-metric nll} is available for an
+        explicitly likelihood-only experiment.
   \item \textbf{Early stopping.} A counter tracks epochs without improvement. When it reaches
         \code{--patience} (default 30), training halts \TrainL{421}. Set patience to 0 to
         disable.
@@ -1837,9 +1877,11 @@ After the batches, step the learning-rate schedule and run
 \textbf{File} & \textbf{Contents} \\
 \midrule
 \code{manifest.json} & Every configuration value, dataset statistics, split totals, best score \\
+\code{dataset\_validation.json} & Result of checking every dataset row and shard \\
 \code{splits.json}   & The exact row indices of each split, plus the provenance description \\
-\code{scaler.pkl}    & The fitted input scaler --- required to use the model \\
-\code{model\_best.pt} & Weights at the best validation NLL \\
+\code{input\_transform.json} & Exact centre and scale required to use the model \\
+\code{scaler.pkl}    & Original fitted scikit-learn object, retained for inspection \\
+\code{model\_best.pt} & Weights at the best configured validation metric \\
 \code{model\_last.pt} & Weights at the final epoch \\
 \code{tb/}            & TensorBoard event files for live curves \\
 \code{train.log}      & Per-epoch loss table, also echoed to the terminal \\
@@ -1847,8 +1889,8 @@ After the batches, step the learning-rate schedule and run
 \end{tabular}
 \end{center}
 
-The existing runs under \code{dirichlet\_mdn\_runs/} follow this layout exactly; see for
-example \code{20260618\_145502\_mpi\_M5\_K16\_500ep\_hidden256/}.
+Older run directories predate these checks and do not necessarily contain the new artifacts;
+they should not be treated as validated under the corrected pipeline.
 
 \section{Devices}
 
@@ -1868,9 +1910,12 @@ evaluates the mixture at every in-triangle cell, multiplies by cell area, renorm
 returns a $(B, 64, 64)$ array directly comparable with the stored histogram. Cells outside the
 triangle are left at zero.
 
-\section{The four numbers that matter}
+\section{The measurements that matter}
 
 \begin{description}[leftmargin=1.6cm, style=nextline]
+  \item[Test negative log-likelihood] The same normalized categorical surprise used for
+        training, now reported separately for every held-out record. This answers whether
+        the model assigned probability where the DNS actually placed it.
   \item[$L_1$ error] \Metric{72}{joint\_l1} sums the absolute cell-by-cell differences,
         $\sum_{ij} |p_{ij} - q_{ij}|$, over the triangle. Because both tables sum to 1, this
         ranges from 0 (identical) to 2 (no overlap at all). Half of it is the fraction of
@@ -1889,7 +1934,9 @@ triangle are left at zero.
   \item[Moment recovery error] \Metric{125}{moment\_recovery\_error} compares the closed-form
         moments of the prediction against the input moments, absolutely and relatively. This is
         the physics constraint: if it is not near zero, the prediction is not usable in a solver
-        regardless of how good the picture looks.
+        regardless of how good the picture looks. The evaluator also divides by the physical
+        scales $[1,0.25,1,0.25,0.25]$ and compares the worst result with
+        \code{--moment-acceptance-tolerance} (default 0.05), writing an explicit pass/fail field.
 \end{description}
 
 \Metric{120}{mixture\_active\_count} additionally counts how many components carry weight above
@@ -1905,6 +1952,21 @@ metric, grouped by scalar configuration and by configuration-and-timestep. This 
 discover that the model is excellent everywhere except one configuration, or that accuracy
 degrades steadily as the flow mixes.
 
+The JSON summary distinguishes three averages. A \term{micro average} gives every retained
+record one vote. A \term{macro average} first averages within each configuration and then gives
+each configuration one vote. A \term{source-weighted average} uses the inverse retention
+weights written by the sampler. Standard deviations are reported alongside micro and macro
+means. These views are all necessary because deliberate diversity selection makes the retained
+dataset unbalanced.
+
+\begin{caution}
+The proposal also asks for a downstream reaction-rate or closure error. That quantity requires
+a reaction-rate function or chemistry table, neither of which this repository supplies.
+The evaluator therefore does \emph{not} invent one. No claim about LES reaction-rate accuracy
+should be made until that external physical definition and a corresponding held-out metric are
+added.
+\end{caution}
+
 \Eval{206}{evaluate\_run} runs the whole pipeline and writes
 \code{metrics\_per\_record.csv}, \code{metrics\_per\_config.csv},
 \code{metrics\_per\_config.md}, \code{metrics\_per\_timestep.csv}, and
@@ -1913,8 +1975,9 @@ degrades steadily as the flow mixes.
 \section{The plots}
 
 \begin{itemize}
-  \item \Plot{46}{plot\_pdf\_comparison} puts the true and predicted histograms side by side as
-        contour maps with a shared colour scale, and overlays the triangle boundary via
+  \item \Plot{46}{plot\_pdf\_comparison} divides probability mass by clipped cell area and puts
+        the true and predicted \emph{densities} side by side using the actual non-uniform bin
+        edges and a shared colour scale. It overlays the triangle boundary via
         \Plot{30}{\_add\_simplex\_overlay}. This is the plot to look at first --- your eye will
         catch structural errors that no single number reports.
   \item \Plot{84}{plot\_metric\_vs\_timestep} draws error against time, one line per
@@ -1942,20 +2005,23 @@ any result.
   \item \Verify{54}{check\_loss\_gradient} --- Push eight real examples forward and backward and
         confirm the loss and every gradient are finite. Catches numerical blow-ups before you
         waste hours on a training run that will produce \code{NaN}.
-  \item \Verify{82}{check\_moment\_loss\_zero\_on\_truth} --- Construct a case where the
-        predicted moments should exactly equal the targets, and confirm the moment loss is about
-        $10^{-10}$. This is a pure algebra check on
-        \Loss{165}{mixture\_moments}; a sign error or a misplaced $\pi_k$ would show up here and
-        essentially nowhere else. It sweeps $K \in \{1, 4, 8\}$ and both input sizes.
+  \item \code{check\_moments\_against\_monte\_carlo} --- Draw 400{,}000 samples with
+        NumPy's independent Dirichlet random generator and compare empirical means, variances,
+        and covariance with the model formulas. This avoids the circular mistake of generating
+        a target with the same helper being tested.
   \item \Verify{98}{check\_permutation\_invariance} --- Shuffle the order of the $K$ components
         and confirm the loss is unchanged to within $10^{-6}$. The components are unordered by
         definition; if relabelling them changed the answer, there would be an indexing bug.
-  \item \Verify{166}{check\_k1\_fits\_analytical\_dirichlet} --- Generate a histogram from a
-        known single Dirichlet, fit a $K=1$ model to it (initialised by
-        \Verify{146}{\_method\_of\_moments\_alpha}), and confirm the recovered parameters are
-        within 2\% of the truth. An end-to-end proof that the machinery can recover a known
-        answer.
+  \item \Verify{166}{check\_k1\_fits\_analytical\_dirichlet} --- Generate 750{,}000 independent
+        NumPy samples from a known single Dirichlet, bin those samples, fit a $K=1$ model, and
+        compare recovered parameters with the truth. The target is no longer produced by the
+        same density routine that is under test.
 \end{enumerate}
+
+The separate \code{pixi run test} command runs deterministic \code{unittest} regressions for
+clipped geometry, scalar validation, global split isolation and fingerprints, concentration
+bounds, target normalization, diagnostic labels, exact preprocessing artifacts, and MPI rank
+provenance.
 
 % ===================================================================
 \chapter{Running Everything}
@@ -1997,6 +2063,7 @@ document.
 \code{merge-only}       & Re-run Phase 2 over an existing \code{\_rank/} tree. No MPI needed \\
 \code{sample-serial}    & The single-process reference sampler \\
 \code{verify}           & The five self-checks \\
+\code{test}             & Deterministic regression tests for the accuracy corrections \\
 \code{diversity}        & Dataset coverage audit with plots \\
 \code{preview-split <seed>} & Build and report a split without training \\
 \code{train <K> <M> <epochs> <tag>} & Train the network.
@@ -2016,6 +2083,7 @@ than retyping long paths.
 
 \begin{enumerate}
   \item \code{pixi install}
+  \item \code{pixi run test} --- run deterministic regression tests
   \item \code{pixi run verify} --- confirms the existing dataset and the code agree
   \item \code{pixi run diversity} --- look at what is actually in the dataset
   \item \code{pixi run preview-split 0} --- see which runs go where
@@ -2029,14 +2097,77 @@ than retyping long paths.
 
 \begin{itemize}
   \item There are only 216 work units, so more than 216 processors buys nothing.
-  \item Each processor needs roughly 1--2~GB for the padded cubes plus its growing selection.
-        Do not oversubscribe a node's memory.
+  \item Phase~1 now keeps every candidate and currently buffers a rank's output before writing.
+        Memory can therefore exceed the old 1--2~GB estimate. Do not oversubscribe a node;
+        monitor memory and divide work among more ranks when necessary.
   \item Always pass \code{--keep-rank-outputs} on a long run. Re-running the merge afterwards
         with \code{--skip-phase1} is minutes; re-running Phase~1 is days.
   \item Phase 2 is single-threaded by construction. On the production dataset it took about
         three hours. Watch the progress lines to confirm it is moving.
   \item Read the manifest's \code{missing\_paths} before using the dataset.
 \end{itemize}
+
+% ===================================================================
+\chapter{Accuracy Review: What Changed and What Did Not}
+% ===================================================================
+
+This chapter is a short map for a new reader who encounters an older dataset, split, or run
+directory. The September 2026 review found that several checks agreed with each other while
+still sharing the same mistaken assumption. The corrections therefore changed the stored data
+format to version~2; old generated data must be rebuilt.
+
+\begin{longtable}{@{}p{3.2cm}p{5.2cm}p{6.0cm}@{}}
+\toprule
+\textbf{Area} & \textbf{Old risk} & \textbf{Corrected behavior} \\
+\midrule
+\endhead
+Serial sampling & Two incompatible programs occupied one file. &
+The serial command calls the canonical MPI implementation with one rank. \\
+Triangle boundary & A rectangle was kept or dropped by its centre. &
+Every rectangle is clipped; its true intersection area and centroid are stored. \\
+Scalar values & Invalid values could disappear during histogramming. &
+Values are checked, tiny round-off is counted and corrected, and every used pair must be counted. \\
+MPI selection & Each rank discarded candidates before the global decision. &
+Phase~1 is lossless; Phase~2 checks provenance and sees every candidate in seeded hash order. \\
+Splits & Scalar configurations could put one physical run in different partitions. &
+Ordinary experiments partition the global run list once, and split files carry a dataset fingerprint. \\
+Training data & Only a small sample of file integrity was checked. &
+Training checks every shard, mapping, histogram, geometry array, and moment discrepancy first. \\
+Moment claim & A penalty was described as an exact constraint. &
+The penalty is dimensionless, total loss selects checkpoints by default, and measured errors get a pass/fail tolerance. \\
+Plots & Unequal-bin probability mass was drawn as though it were density. &
+Plots divide mass by clipped area and use the actual bin edges. \\
+Verification & Some targets were generated by the same formula being tested. &
+NumPy Monte Carlo samples provide independent moment and recovery references. \\
+\bottomrule
+\end{longtable}
+
+\section{Deliberate deviations and remaining limits}
+
+\begin{enumerate}
+  \item \textbf{No singular boundary integration.} A full plan could numerically integrate
+        Dirichlet densities with $\alpha<1$ inside every clipped cell. The implementation instead
+        requires $\alpha\geq1$. This is simpler and stable, but cannot represent exact edge or
+        corner atoms.
+  \item \textbf{Lossless extraction can use substantial memory.} Candidate loss was more serious
+        than speed, so local pruning was removed first. Per-rank incremental writing remains
+        future engineering work.
+  \item \textbf{No invented chemistry score.} Test NLL and PDF/moment errors are implemented.
+        Reaction-rate error is not, because no chemistry function or table is available here.
+  \item \textbf{No silent conversion of old data.} Version-1 histograms may already have lost
+        boundary mass. Version~2 rejects them and requires regeneration.
+  \item \textbf{No real-DNS accuracy result is implied by unit tests.} Synthetic tests verify
+        logic. Production acceptance still requires regenerating the private DNS-derived data,
+        running MPI rank-count/seed studies, training, and evaluating held-out runs.
+\end{enumerate}
+
+\begin{plainbox}{The practical rule}
+Trust a result only when \code{pixi run test} passes, the run contains
+\code{dataset\_validation.json} and \code{input\_transform.json}, the split fingerprint matches,
+the evaluation's moment acceptance field passes, and the relevant held-out PDF metrics are
+reported. Even then, a separate reaction-rate test is required before claiming LES closure
+accuracy.
+\end{plainbox}
 
 % ===================================================================
 \chapter*{Glossary}
@@ -2126,7 +2257,7 @@ than retyping long paths.
 591  & \code{build\_arg\_parser} & All command-line options \\
 628  & \code{enumerate\_work\_units} & All (run, configuration) pairs \\
 636  & \code{partition\_work\_units} & Round-robin deal to processors \\
-640  & \code{process\_work\_units\_on\_rank} & Phase 1: per-processor greedy selection \\
+640  & \code{process\_work\_units\_on\_rank} & Phase 1: lossless per-processor extraction \\
 766  & \code{write\_rank\_outputs} & Phase 1 output, including empty manifests \\
 831  & \code{iter\_rank\_candidates} & Fast streaming read-back of candidates \\
 881  & \code{merge\_per\_rank\_outputs} & Phase 2: global merge with novelty cache \\
@@ -2152,7 +2283,6 @@ than retyping long paths.
 \code{data.collate\_records}          & 224 & Batches examples into tensors \\[3pt]
 \code{splits.SplitResult}             & 28  & Split indices plus provenance \\
 \code{splits.\_split\_runs}           & 35  & Seeded shuffle-and-slice by run \\
-\code{splits.\_split\_timesteps}      & 57  & Contiguous fallback split \\
 \code{splits.make\_split}             & 80  & The leak-free split policy \\
 \code{splits.save\_split}             & 211 & Writes \code{splits.json} \\
 \code{splits.load\_split}             & 223 & Reads \code{splits.json} \\[3pt]
@@ -2194,7 +2324,7 @@ than retyping long paths.
 \code{plotting.write\_pdf\_album}     & 171 & Multi-page PDF of figures \\[3pt]
 \code{verify.check\_bins}             & 43  & Grid agreement check \\
 \code{verify.check\_loss\_gradient}   & 54  & Finite loss and gradients \\
-\code{verify.check\_moment\_loss\_zero\_on\_truth}& 82 & Moment algebra check \\
+\code{verify.check\_moments\_against\_monte\_carlo}& 82 & Independent moment check \\
 \code{verify.check\_permutation\_invariance}& 98 & Component-order independence \\
 \code{verify.check\_k1\_fits\_analytical\_dirichlet}& 166 & End-to-end recovery test \\
 \bottomrule

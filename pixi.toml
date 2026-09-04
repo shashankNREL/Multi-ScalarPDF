@@ -55,7 +55,6 @@ mpirun -n {{ nranks }} python EnsightPDFHybridDatasetMPI.py \
   --max-per-moment-bin 50 \
   --moment-bins 12,12,12,12,12 \
   --shape-threshold 0.03 \
-  --per-rank-cap-multiplier 2 \
   --keep-rank-outputs \
   --dataset-tag $DATASET_TAG \
   --output-dir $SAMPLE_OUT
@@ -81,6 +80,13 @@ description = "Re-run Phase 2 (the merge) over an existing _rank/ tree, no MPI n
 cmd = """
 python EnsightPDFHybridDatasetMPI.py \
   --skip-phase1 \
+  --folder $DNS_ROOT \
+  --run-ids 0:27 \
+  --scalar-configs I1,I4,I5,L1,PI1,PI4,PI5,PL1 \
+  --box-widths 64,128 \
+  --strides 32,64 \
+  --tstart 17 --tend 30 \
+  --pdf-bins 64 --zst 0.1 \
   --output-dir $SAMPLE_OUT \
   --dataset-tag $DATASET_TAG \
   --max-per-moment-bin 50 \
@@ -107,12 +113,16 @@ python EnsightPDFHybridDataset.py \
 # ---------------------------------------------------------------------------
 
 [tasks.verify]
-description = "Five self-checks: bin grid, gradients, moment algebra, permutation invariance, K=1 recovery"
+description = "Five self-checks: bin grid, gradients, Monte Carlo moments, permutation invariance, K=1 recovery"
 cmd = "python -m dirichlet_mdn.verify --parquet $PARQUET --hdf5-dir $HDF5_DIR"
+
+[tasks.test]
+description = "Run deterministic unit tests for geometry, sampling, splitting, losses, and provenance"
+cmd = "python -m unittest discover -s tests -v"
 
 [tasks.diversity]
 description = "Audit dataset coverage: cell counts, moment percentiles, simplex coverage, plots"
-cmd = "python -m dirichlet_mdn.dataset_diversity --parquet $PARQUET --out-dir diagnostics/hybrid_dataset_mpi"
+cmd = "python -m dirichlet_mdn.dataset_diversity --parquet $PARQUET --hdf5-dir $HDF5_DIR --out-dir diagnostics/hybrid_dataset_mpi"
 
 [tasks.preview-split]
 description = "Build and report the train/val/test split without training anything"

@@ -26,6 +26,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional
@@ -38,7 +39,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .bin_grid import bin_grid
-from .data import HybridPDFDataset, collate_records, load_metadata
+from .data import (
+    HybridPDFDataset,
+    collate_records,
+    load_metadata,
+    validate_dataset,
+)
 from .losses import HistogramNLL, LossWeights, combined_loss
 from .model import DirichletMDN
 from .splits import load_split, make_split, save_split
@@ -80,6 +86,9 @@ class TrainConfig:
     log_every_n_batches: int
     cache_histograms: bool
     flat_histograms: bool
+    max_moment_discrepancy: float
+    selection_metric: str
+    moment_acceptance_tolerance: float
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,26 @@ class TorchScaler:
         scale = np.where(scale < 1e-6, 1.0, scale)
         self.scale_ = torch.as_tensor(scale, dtype=torch.float32)
 
+    @classmethod
+    def from_artifact(cls, artifact: Dict) -> "TorchScaler":
+        if artifact.get("format_version") != 1:
+            raise ValueError("unsupported input-transform artifact version")
+        if artifact.get("type") != "robust_scaler_affine":
+            raise ValueError("unsupported input-transform artifact type")
+        center = np.asarray(artifact["center"], dtype=np.float32)
+        scale = np.asarray(artifact["scale"], dtype=np.float32)
+        if center.ndim != 1 or scale.shape != center.shape:
+            raise ValueError("invalid input-transform center/scale shapes")
+        if not np.isfinite(center).all() or not np.isfinite(scale).all():
+            raise ValueError("input-transform parameters must be finite")
+        if np.any(scale <= 0.0):
+            raise ValueError("input-transform scales must be positive")
+        obj = cls.__new__(cls)
+        obj.scaler = None
+        obj.center_ = torch.as_tensor(center, dtype=torch.float32)
+        obj.scale_ = torch.as_tensor(scale, dtype=torch.float32)
+        return obj
+
     def to(self, device: torch.device) -> "TorchScaler":
         self.center_ = self.center_.to(device)
         self.scale_ = self.scale_.to(device)
@@ -122,6 +151,16 @@ class TorchScaler:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.center_) / self.scale_
+
+    def to_artifact(self) -> Dict:
+        """Return the exact affine transform used by the model."""
+        return {
+            "format_version": 1,
+            "type": "robust_scaler_affine",
+            "center": self.center_.detach().cpu().tolist(),
+            "scale": self.scale_.detach().cpu().tolist(),
+            "formula": "(x - center) / scale",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +224,7 @@ def write_manifest(cfg: TrainConfig, run_dir: Path, extras: dict) -> None:
     manifest = {
         "config": asdict(cfg),
         "extras": extras,
-        "created_utc": _dt.datetime.utcnow().isoformat() + "Z",
+        "created_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     }
     with open(run_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2, default=str)
@@ -211,31 +250,39 @@ def setup_logger(run_dir: Path) -> logging.Logger:
 
 
 def train(cfg: TrainConfig) -> Path:
+    if cfg.selection_metric not in {"total", "nll"}:
+        raise ValueError("selection_metric must be 'total' or 'nll'")
+    if cfg.moment_acceptance_tolerance <= 0.0:
+        raise ValueError("moment_acceptance_tolerance must be positive")
+    if cfg.max_moment_discrepancy <= 0.0:
+        raise ValueError("max_moment_discrepancy must be positive")
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(cfg.output_dir) / f"{timestamp}_{cfg.tag}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    run_dir = Path(cfg.output_dir) / f"{timestamp}_{cfg.tag}_{uuid.uuid4().hex[:8]}"
+    run_dir.mkdir(parents=True, exist_ok=False)
     log = setup_logger(run_dir)
     log.info(f"Run dir: {run_dir}")
     log.info(f"Config: {asdict(cfg)}")
 
     meta = load_metadata(cfg.parquet)
     log.info(f"Loaded metadata: {len(meta)} rows, configs={sorted(meta['scalar_config'].unique().tolist())}")
+    validation = validate_dataset(
+        cfg.parquet,
+        cfg.hdf5_dir,
+        num_bins=cfg.num_bins,
+        zst=cfg.zst,
+        uniform_bins=cfg.uniform_bins,
+        max_moment_discrepancy=cfg.max_moment_discrepancy,
+    )
+    with open(run_dir / "dataset_validation.json", "w") as f:
+        json.dump(validation, f, indent=2)
+    log.info(f"Validated all dataset rows: {validation}")
 
     if cfg.splits_json:
-        split = load_split(cfg.splits_json)
+        split = load_split(cfg.splits_json, meta=meta)
         log.info(f"Loaded pre-computed split from {cfg.splits_json}")
-        n_meta = len(meta)
-        bad = [name for name, arr in (("train", split.train), ("val", split.val), ("test", split.test))
-               if len(arr) > 0 and (arr.max() >= n_meta or arr.min() < 0)]
-        if bad:
-            raise ValueError(
-                f"Split indices in {cfg.splits_json} are out of range for parquet "
-                f"with {n_meta} rows (offending splits: {bad}). The split must have "
-                f"been built from the same parquet."
-            )
     else:
         split = make_split(
             meta, seed=cfg.seed,
@@ -244,6 +291,8 @@ def train(cfg: TrainConfig) -> Path:
         )
     save_split(split, str(run_dir / "splits.json"))
     log.info(f"Split totals: {split.description['totals']}")
+    if len(split.train) == 0 or len(split.val) == 0:
+        raise ValueError("training and validation splits must both be non-empty")
 
     train_ds = HybridPDFDataset(
         cfg.parquet, cfg.hdf5_dir,
@@ -252,6 +301,7 @@ def train(cfg: TrainConfig) -> Path:
         num_bins=cfg.num_bins, zst=cfg.zst, uniform_bins=cfg.uniform_bins,
         cache_histograms=cfg.cache_histograms,
         flat_histograms=cfg.flat_histograms,
+        max_moment_discrepancy=cfg.max_moment_discrepancy,
     )
     val_ds = HybridPDFDataset(
         cfg.parquet, cfg.hdf5_dir,
@@ -260,6 +310,7 @@ def train(cfg: TrainConfig) -> Path:
         num_bins=cfg.num_bins, zst=cfg.zst, uniform_bins=cfg.uniform_bins,
         cache_histograms=cfg.cache_histograms,
         flat_histograms=cfg.flat_histograms,
+        max_moment_discrepancy=cfg.max_moment_discrepancy,
     )
 
     scaler = HybridPDFDataset.fit_input_scaler(train_ds.meta, cfg.input_moments)
@@ -270,6 +321,8 @@ def train(cfg: TrainConfig) -> Path:
     log.info(f"Device: {device}")
 
     torch_scaler = TorchScaler(scaler).to(device)
+    with open(run_dir / "input_transform.json", "w") as f:
+        json.dump(torch_scaler.to_artifact(), f, indent=2)
     grid = train_ds.grid
     nll_module = HistogramNLL(grid).to(device)
     model = DirichletMDN(
@@ -406,8 +459,9 @@ def train(cfg: TrainConfig) -> Path:
             "train_metrics": train_metrics,
         }, last_path)
 
-        if len(val_ds) > 0 and val_metrics["nll"] < best_val:
-            best_val = val_metrics["nll"]
+        selection_value = val_metrics[cfg.selection_metric]
+        if len(val_ds) > 0 and selection_value < best_val:
+            best_val = selection_value
             epochs_without_improve = 0
             torch.save({
                 "epoch": epoch,
@@ -415,7 +469,9 @@ def train(cfg: TrainConfig) -> Path:
                 "val_metrics": val_metrics,
                 "train_metrics": train_metrics,
             }, best_path)
-            log.info(f"  -> new best val NLL = {best_val:.4f}")
+            log.info(
+                f"  -> new best val {cfg.selection_metric} = {best_val:.4f}"
+            )
         else:
             epochs_without_improve += 1
             if cfg.patience > 0 and epochs_without_improve >= cfg.patience:
@@ -429,7 +485,8 @@ def train(cfg: TrainConfig) -> Path:
     extras = {
         "dataset_summary": _dataset_summary(meta),
         "split_totals": split.description["totals"],
-        "best_val_nll": float(best_val) if best_val != float("inf") else None,
+        "selection_metric": cfg.selection_metric,
+        "best_val_metric": float(best_val) if best_val != float("inf") else None,
         "num_simplex_cells": nll_module.num_simplex_cells,
         "deviation_note": (
             "Histogram-categorical NLL with simplex renormalization is used in "
@@ -461,7 +518,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--lambda-mom", type=float, default=0.5)
     p.add_argument("--lambda-ent", type=float, default=1e-3)
-    p.add_argument("--alpha-min", type=float, default=1e-3)
+    p.add_argument("--alpha-min", type=float, default=1.0)
     p.add_argument("--alpha-clip", type=float, default=1e3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-dir", default="dirichlet_mdn_runs")
@@ -471,8 +528,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="If set, this scalar_config is the entire test set")
     p.add_argument("--split-fallback", default="timestep",
                    choices=("timestep", "train_only"),
-                   help="Behavior when a config has <3 unique run_ids "
-                        "(preliminary dataset only)")
+                   help="Deprecated compatibility option; splits never cross run IDs")
     p.add_argument("--splits-json", default=None,
                    help="Optional path to a pre-computed splits.json "
                         "(e.g. from preview_split.py). If set, "
@@ -492,6 +548,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--flat-histograms", action="store_true",
                    help="Store/pass histograms pre-flattened to in-simplex cells "
                         "(skips a reshape+mask inside HistogramNLL every batch).")
+    p.add_argument("--max-moment-discrepancy", type=float, default=0.05,
+                   help="Maximum accepted direct-vs-histogram moment error")
+    p.add_argument("--selection-metric", choices=("total", "nll"), default="total",
+                   help="Validation metric used for checkpoints and early stopping")
+    p.add_argument("--moment-acceptance-tolerance", type=float, default=0.05,
+                   help="Maximum accepted moment error divided by physical range")
     return p
 
 
@@ -527,6 +589,9 @@ def cli(argv: Optional[Iterable[str]] = None) -> int:
         log_every_n_batches=int(args.log_every_n_batches),
         cache_histograms=bool(args.cache_histograms),
         flat_histograms=bool(args.flat_histograms),
+        max_moment_discrepancy=float(args.max_moment_discrepancy),
+        selection_metric=str(args.selection_metric),
+        moment_acceptance_tolerance=float(args.moment_acceptance_tolerance),
     )
     train(cfg)
     return 0

@@ -1,6 +1,6 @@
 # Data-driven joint PDF for three-stream mixing via Dirichlet-Mixture Density Networks
 
-A plan for replacing the pixel-wise softmax DNN of Yellapantula et al. (2019) with a parametric mixture model that lives natively on the 2-simplex, subsuming the analytical hierarchy of Perry & Mueller (2018).
+A plan for replacing the pixel-wise softmax DNN of Yellapantula et al. (2019) with a parametric mixture model that lives natively on the 2-simplex and can be tested against the analytical hierarchy of Perry & Mueller (2018).
 
 ## 1. Problem context
 
@@ -10,7 +10,7 @@ $$
 \mathcal{T} = \{(Z_1, Z_2) : Z_1 \ge 0,\ Z_2 \ge 0,\ Z_1 + Z_2 \le 1\}.
 $$
 
-For LES closure, we need a model that maps subgrid moments $(\tilde Z_1, \tilde Z_2, \widetilde{Z_1''^2}, \widetilde{Z_2''^2}, \widetilde{Z_1''Z_2''})$ to $P(Z_1, Z_2)$ that is **valid** (non-negative, normalized, supported on $\mathcal{T}$), **moment-consistent**, and **accurate** across all mixing regimes (equal, favored, layered, premixed).
+For LES closure, we need a model that maps subgrid moments $(\tilde Z_1, \tilde Z_2, \widetilde{Z_1''^2}, \widetilde{Z_2''^2}, \widetilde{Z_1''Z_2''})$ to $P(Z_1, Z_2)$ that is **valid** (non-negative, normalized, supported on $\mathcal{T}$), has **measurably small moment errors**, and is **tested** across all mixing regimes (equal, favored, layered, premixed).
 
 ### 1.1 Analytical baseline (Perry & Mueller 2018)
 
@@ -32,7 +32,7 @@ The decision tree (their Fig. 1) requires knowing the mixing configuration to pi
 The current model predicts all 4096 entries of a $64 \times 64$ histogram of $P(Z_1, Z_2)$ via a softmax output layer trained with BCE loss. Limitations:
 
 1. ~50% of output cells are forced to be zero (upper triangle) — wasted capacity.
-2. No physical priors: support, normalization, beta marginals, moment consistency are all *learned* rather than *enforced*.
+2. Softmax and masking address normalization and support, but the 4096 outputs do not encode simplex geometry or marginal shape; moment consistency must be learned and measured.
 3. RF model balloons to ~48 GB; DNN spuriously places mass at pure-component corners (visible in I3, I4 figures).
 4. Heavy imbalance: most binned PDFs are near-$\delta$ at late times → easy regime dominates training.
 5. Layered cases (L1, L2, PL1) — the hardest for the analytical models — also remain hard for the pixel-wise DNN.
@@ -115,7 +115,7 @@ Three intuitions:
 
 ### 2.4 What the mixture of Dirichlets adds
 
-A weighted sum of $K$ Dirichlets, each with its own $\boldsymbol{\alpha}_k$ and weight $\pi_k$, is a **universal density approximator** on the simplex. Concretely, in your problem:
+In approximation theory, mixtures with a growing number of components and unrestricted positive concentrations can approximate broad classes of continuous simplex densities. **That theorem does not mean this finite, bounded implementation is universal.** The implemented model uses a chosen finite $K$, $1 \leq \alpha_i \leq 10^3$, and a grid approximation; it cannot represent probability atoms exactly on edges or vertices. Concretely, in your problem:
 
 | Mixing regime              | What the mixture does |
 |----------------------------|-----------------------|
@@ -169,7 +169,7 @@ The density on the simplex is closed-form via change of variables, so NLL traini
 
 The cleanest description in the paper is **not** "we trained a bigger neural network." It is:
 
-> The network is a learned moment-to-parameter map for a fixed parametric family (mixture of Dirichlets on the simplex). The family is chosen because (i) each component coincides with the Dirichlet distribution that Perry & Mueller (2018) identified as the natural baseline for three-component mixing, (ii) the mixture is a universal density approximator on the simplex and recovers CM, BVB5, and Beta-Delta as limiting cases, and (iii) validity, support, normalization, and moment self-consistency are built into the analytical family rather than learned from data.
+> The network is a learned moment-to-parameter map for a fixed parametric family (a finite mixture of Dirichlets on the simplex). The family is chosen because (i) each component uses the natural three-component Dirichlet baseline, (ii) multiple components can approximate many smooth multimodal interior PDFs, and (iii) support and normalization are built into the analytical family. Moment agreement is encouraged by a penalty and must be measured; exact edge or vertex atoms are outside the implemented family.
 
 This is a much sharper claim than "DNN with 4096 outputs is more accurate than the analytical model," and gives the model a clear interpretation that maps onto the existing combustion literature.
 
@@ -204,10 +204,10 @@ Input (5) → Linear(5→128) → SiLU → Linear(128→256) → SiLU
 
 A single Dirichlet cannot represent favored mixing or multimodal early-time PDFs. A *mixture* of Dirichlets can:
 
-- $K = 1$ recovers the Dirichlet limit of Perry & Mueller exactly.
-- $K = 2$ with one near-$\delta$ component reproduces Beta-Delta limits.
+- $K = 1$ represents a single Dirichlet with concentrations in the implemented range $[1,10^3]$.
+- $K = 2$ can approximate an interior narrow component, but not an exact $\delta$ atom.
 - Several components with disjoint support recover CM- and BVB5-like asymmetric mixing.
-- Many near-$\delta$ components recover early-time corner-concentrated PDFs (cases I1 at $t \to 0$).
+- Many concentrated components can approximate some early-time peaks, subject to measurable error near corners.
 - The mixture has beta-distribution marginals (a mixture of betas — actually richer than the analytical BVB5 marginals, which are infinite sums of betas anyway).
 
 **Closed-form properties for Dirichlet mixtures** (useful for both training and validation):
@@ -250,7 +250,7 @@ The pathological regime is early-time pure components: three near-delta componen
 #### Practical reasons the nominal $K$ should be larger than the per-shape minimum
 
 1. **Mode-collapse slack.** In trained MDNs, 1–3 components typically end up with vanishingly small $\pi_k$ on any given input. Effective $K$ is ~60–80% of nominal $K$.
-2. **Universal-approximation rate.** Dirichlet mixtures on the simplex achieve $L^1$ error roughly $\sim K^{-1/d}$ for smooth densities ($d = 2$ here). The compositional-data literature typically uses $K \approx 10\text{–}30$ for ~1% $L^1$ error.
+2. **Approximation capacity.** More components generally increase capacity for smooth multimodal densities, but no fixed $K$ guarantees a specified error on this dataset. Choose $K$ by held-out measurements.
 3. **Layered cases** — the ones where Perry & Mueller's analytical models struggled most — need multi-modal mixtures. Do not under-budget for them.
 4. **You now have ~156 DNS configurations** worth of training data. A capacity-limited model leaves accuracy on the table.
 
@@ -286,7 +286,7 @@ $$
 
 where:
 
-- $\mathcal{L}_{\text{mom}} = \| \mathbf{m}(\boldsymbol{\pi}, \boldsymbol{\alpha}) - \mathbf{m}_{\text{input}} \|_2^2$ — enforces that the predicted mixture has the moments it was conditioned on. Uses the closed-form expressions in §3.2.
+- $\mathcal{L}_{\text{mom}}$ is a dimensionless squared error between predicted and conditioning moments — it encourages, but does not enforce, equality. The implementation scales means by 1 and variances/covariance by 0.25, uses the closed-form expressions in §3.2, and reports residual errors explicitly.
 - $\mathcal{L}_{\text{ent}} = -\beta \sum_k \pi_k \log \pi_k$ — entropy regularizer on mixture weights to prevent collapse to a single component (standard trick for MDNs; see Eigen et al. 2013, Pereyra et al. 2017).
 - Hyperparameters: $\lambda_m \in [0.1, 1]$, $\lambda_e \in [10^{-3}, 10^{-2}]$.
 
@@ -294,14 +294,14 @@ The Dirichlet log-density is closed-form and differentiable, so no reparameteriz
 
 ### 3.5 Connection to the Perry & Mueller hierarchy
 
-This mixture model **subsumes the analytical decision tree**:
+This mixture model is a **single alternative to compare with the analytical decision tree**. It may approximate several regimes, but the correspondences below are hypotheses to test rather than exact identities:
 
 | Mixing regime | Recovered by mixture |
 |---|---|
-| All components mix equally → Dirichlet | $K{=}1$, single concentration vector |
-| Favored pair → CM | $K{=}2$, components separated in favored direction |
-| Two favored pairs → BVB5 | $K{=}3$ with asymmetric concentrations |
-| Full premixing → Beta-Delta | $K{=}2$ with one collapsed component |
+| Smooth interior Dirichlet-like regime | $K{=}1$, with all concentrations in $[1,10^3]$ |
+| Favored pair → CM-like | Multiple components separated in the favored direction; accuracy must be measured |
+| Two favored pairs → BVB5-like | Multiple asymmetric components; not an exact analytical identity |
+| Full premixing → Beta-Delta-like | A narrow interior component can be approximated; an exact delta cannot |
 | Unknown / layered | Many active components, learned from data |
 
 The network *learns* which configuration is active from the input moments — no foreknowledge needed.
@@ -646,11 +646,11 @@ Three layers, framed honestly:
 
 2. **Application to multi-scalar subgrid PDF closure** — no published Dirichlet-mixture MDN for joint scalar PDFs in turbulent combustion. The closest precedent (Bode et al. 2023) uses a *Gaussian* MDN for reaction rates, which is the wrong base distribution for compositions. **This is novel in the combustion-ML literature.**
 
-3. **Scientific framing** — replacing the analytical decision tree of Perry & Mueller (2018) with a single moment-conditioned mixture that subsumes Dirichlet/CM/BVB5/Beta-Delta as limits, validated on DNS that explicitly covers all the configurations the analytical models were designed for. **This is the actual publishable contribution.**
+3. **Scientific framing** — testing whether one moment-conditioned finite mixture can approximate the regimes handled by the analytical decision tree, while stating its boundary limitations and validating every claim on held-out DNS.
 
 Suggested framing sentence for the paper:
 
-> "Mixture density networks (Bishop 1994) with Dirichlet components on the simplex (Sadowski & Baldi 2019; Tsuchida et al. 2019) have not previously been applied to joint subgrid PDF closure for multiscalar turbulent mixing. We adopt this architecture as a unified data-driven alternative to the analytical bivariate-beta hierarchy of Perry and Mueller (2018), in which the Dirichlet, CM, and BVB5 distributions appear as limiting cases."
+> "Mixture density networks (Bishop 1994) with Dirichlet components on the simplex (Sadowski & Baldi 2019; Tsuchida et al. 2019) have not previously been applied to joint subgrid PDF closure for multiscalar turbulent mixing. We test a finite, bounded version of this architecture as a unified data-driven alternative to the analytical bivariate-beta hierarchy of Perry and Mueller (2018), while measuring moment error and treating boundary atoms as outside the implemented family."
 
 ## 7. References
 

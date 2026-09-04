@@ -4,6 +4,10 @@
 
 This file is the running record of the implementation of `dirichlet_mdn/` (PyTorch training, validation, and verification of a Dirichlet Mixture Density Network for three-stream subgrid PDF closure). It is updated incrementally as work happens, not retroactively.
 
+> **Current-status note (2026-09-04):** early sections preserve the original
+> implementation history. The later **Accuracy remediation** section is
+> authoritative wherever behavior has changed.
+
 Companion documents:
 
 - `DirichletMDN_proposal.md` — the scientific methodology and motivation.
@@ -320,9 +324,154 @@ PYTHONPATH=. python -m dirichlet_mdn.train \
 - Active-learning data-selection loop — out of this code's scope (needs DNS access).
 - Conditional reaction-rate $\overline{\dot\omega}$ comparison — needs a chemistry table; defer to a follow-up.
 
+## Accuracy remediation (2026-09-04)
+
+This section supersedes older implementation descriptions where they conflict.
+It records the fixes approved after `CODE_REVIEW.md`.
+
+### Implemented corrections
+
+- **B1 — canonical sampler:** `EnsightPDFHybridDataset.py` is now a small
+  single-rank wrapper around `EnsightPDFHybridDatasetMPI.py`. Serial and MPI use
+  one extraction algorithm and one HDF5/Parquet schema.
+- **B2/B3 — honest splits:** counts respect zero ratios; a named holdout is the
+  only test configuration; ordinary splits partition global physical `run_id`
+  values once across every scalar configuration. Timestep fallback was removed
+  because it leaked one evolution across partitions.
+- **B4/H1 — one simplex convention:** rectangular cells are clipped against
+  the physical triangle. Stored areas and centroids describe the clipped
+  polygons, and area sums to 0.5. Writing, loading, NLL, rendering, moments,
+  metrics, and plots now use this convention. Targets are validated and
+  normalized. Concentrations are restricted to `alpha >= 1` so centroid
+  quadrature never pretends to resolve an infinite boundary density.
+- **B5/H2 — MPI correctness and provenance:** Phase 1 collects every candidate.
+  The merge rejects stale, missing, extra, lossy, or configuration-incompatible
+  rank output. Candidates are globally ordered by a seeded SHA-256 hash of
+  physical identity, so changing rank count does not change arrival order.
+- **H3 — safe publication:** cleanup matches only canonical shard names for the
+  exact dataset tag. New output is built in a staging directory, data files are
+  renamed into place, and the manifest is published last as the commit marker.
+- **H4 — scalar validation:** paired arrays must match; all values are checked
+  for finiteness, bounds, and the simplex rule. Tolerance corrections and
+  explicit drops are counted. Histogramming must account for every validated
+  pair. EnSight files must contain exactly the expected number of scalar values.
+- **H5/M6 — truthful moment handling:** moment agreement remains a regularizer,
+  not a construction guarantee. Moment MSE is dimensionless, using physical
+  scales `[1, .25, 1, .25, .25]`. Checkpoint selection defaults to total
+  validation loss. Evaluation reports absolute, target-relative, and
+  physical-scale-relative errors plus an explicit tolerance pass/fail result.
+- **H6 — independent references:** moment formulas are compared with independent
+  NumPy Monte Carlo samples. The K=1 recovery target is also made from NumPy
+  samples rather than the density helper being tested.
+- **H7 — complete available evaluation:** per-record held-out NLL is reported
+  with L1, joint/marginal JSD, and moment errors. The reaction-rate metric remains
+  explicitly deferred because no chemistry function or table is present.
+- **H8/M1/M2 — integrity:** all direct-versus-histogram moment discrepancies are
+  audited against a configurable limit. Training exhaustively validates every
+  shard, histogram, mapping, sample ID, and geometry. Splits carry a metadata
+  fingerprint and are checked for identity, uniqueness, overlap, coverage,
+  holdout purity, and physical-run isolation.
+- **M3 — exact preprocessing artifact:** `input_transform.json` stores the exact
+  effective center and scale used by PyTorch. Evaluation uses this artifact;
+  `scaler.pkl` is retained only for inspection and compatibility.
+- **M4/M5 — accurate diagnostics:** non-uniform-grid plots show density
+  (`mass / clipped area`) at actual bin edges. Low relative variance is labeled
+  well mixed; high relative variance is labeled highly segregated.
+- **M7 — visible selection weighting:** deterministic hash ordering removes
+  systematic run/configuration arrival order and can be varied with
+  `--selection-seed`. Every retained row stores source candidate/retained counts
+  and an inverse retention weight. Evaluation reports micro, macro, per-config,
+  per-timestep, and source-weighted summaries with dispersion.
+- **M8 — bounded claims:** README, proposal, and LaTeX now state that finite,
+  bounded mixtures cannot exactly represent edge/vertex atoms or guarantee
+  moment equality.
+- **L1/L2/L3 — reproducibility:** run directories use microseconds plus a random
+  suffix and refuse reuse. Grid, decomposition, threshold, ID, and binary-size
+  invariants fail before expensive work. `pixi run test` provides deterministic
+  synthetic regression coverage without proprietary DNS data.
+
+### Validation and review follow-up
+
+- All 19 deterministic regression tests pass, including exact clipped-simplex
+  area, serial/MPI identity, global-run split isolation, rank provenance,
+  zero-safe metrics, and exhaustive synthetic-dataset validation. The validator
+  test also alters an HDF5 row after writing and confirms that the stored
+  metadata mismatch is rejected.
+- Independent NumPy verification passes: the largest analytical-versus-Monte
+  Carlo moment difference was \(9.683\times10^{-5}\), and the recovered
+  single-Dirichlet concentration had 0.38% maximum relative error.
+- A fresh 30-record synthetic dataset passed exhaustive preflight validation,
+  completed one CPU training epoch, and completed held-out evaluation. Its
+  one-epoch model failed the configured moment-accuracy threshold, as expected;
+  the important workflow check is that the failure was measured and reported.
+- Python byte-compilation and `git diff --check` pass. The declared Pixi/TeX
+  environment was unavailable in this runner, so validation used the installed
+  Python packages and the LaTeX guide could not be compiled here.
+- Review follow-up tied every Phase-1 HDF5 row to Parquet sample/local IDs,
+  made dataset-bound verification accept non-default grid arguments, and
+  removed the remaining proposal claims of exact moment enforcement or exact
+  subsumption of the analytical hierarchy.
+
+### Deviations from the approved remediation plan
+
+1. **Boundary integration was replaced by a restricted family.**
+   - Planned: numerically integrate components with concentrations below one in
+     every clipped boundary cell.
+   - Implemented: require every concentration to be at least one and evaluate
+     density at each clipped-cell centroid.
+   - Reason: reliable singular-cell integration needs a substantially more
+     expensive quadrature design and convergence study.
+   - Consequence: the model is stable and its limitation is explicit, but exact
+     edge/corner atoms and below-one Dirichlets are unsupported.
+
+2. **Lossless Phase 1 is not yet incrementally written.**
+   - Planned preference: a lossless collector with bounded memory.
+   - Implemented: lossless collection is buffered per rank, then written.
+   - Reason: correctness and rank-count independence were prioritized over a
+     larger streaming-writer refactor.
+   - Consequence: candidate loss is fixed, but large jobs can use substantially
+     more rank memory. The LaTeX guide warns operators explicitly.
+
+3. **Downstream closure error is deferred rather than fabricated.**
+   - Planned: report conditional reaction-rate error.
+   - Implemented: held-out NLL and all available PDF/moment metrics; no reaction
+     metric.
+   - Reason: the repository has no reaction-rate function, chemistry table, or
+     accepted reference values.
+   - Consequence: no LES reaction-rate accuracy claim is supported yet.
+
+4. **Legacy datasets are rejected rather than repaired.**
+   - Planned: measure whether existing center-masked files were salvageable.
+   - Implemented: format version 2 requires clipped centroids and exhaustive
+     validation rejects legacy geometry.
+   - Reason: discarded boundary mass cannot be reconstructed from normalized
+     legacy histograms.
+   - Consequence: datasets must be regenerated before training.
+
+5. **Validation in this change uses synthetic data only.**
+   - Planned: also regenerate and train on DNS data.
+   - Implemented: deterministic synthetic tests and source compilation.
+   - Reason: raw DNS, generated HDF5/Parquet datasets, and checkpoints are not
+     present in this repository clone.
+   - Consequence: real-data MPI sampling and training remain operator acceptance
+     steps; no empirical accuracy number is claimed here.
+
+### Superseded earlier deviations
+
+- The previous timestep split fallback is removed.
+- The K=1 self-check no longer generates its target with the code under test.
+- The scaler's zero-scale guard is now captured exactly in
+  `input_transform.json`.
+- Older output-schema and best-validation-NLL descriptions above are historical;
+  the corrected artifacts and default total-loss selection are authoritative.
+
 ## Change log
 
 Newest first. Format: `- YYYY-MM-DD: <one-line summary>`.
 
+- 2026-09-04: Implemented the approved accuracy remediation across sampling,
+  simplex geometry, MPI provenance, splits, training artifacts, evaluation,
+  diagnostics, independent verification, tests, and novice LaTeX documentation.
+  Deviations and unavailable real-data acceptance steps are recorded above.
 - 2026-06-16: First end-to-end pipeline landed and validated. All five verify checks pass; 3-epoch smoke training in both 4-input and 5-input variants runs cleanly (train NLL 4.22 → 3.45 in 3 epochs); evaluator produces 322-record metrics table and full plot set on the smoke run. Implementation summary, exact output schema, CLI arguments, and example commands sections all populated. Five deviations from the plan documented (timestep-fallback split mode, explicit broadcasting in `mixture_logpdf`, hand-written Markdown table writer, zero-scale guard in `TorchScaler`, K=1 verify init via method-of-moments).
 - 2026-06-16: Created implementation log skeleton. Plan persisted to `DirichletMDN_implementation_plan.md`.

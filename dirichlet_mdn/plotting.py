@@ -51,28 +51,46 @@ def plot_pdf_comparison(
     subtitle: str = "",
     cmap: str = "RdBu_r",
 ) -> plt.Figure:
-    z1, z2 = np.meshgrid(grid.centers_a, grid.centers_b, indexing="ij")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4))
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(9, 4), layout="constrained",
+    )
     fig.suptitle(title)
 
-    levels = np.linspace(0.0, max(hist_true.max(), hist_pred.max()) + 1e-9, 21)
-    ax1.contourf(z1, z2, hist_true, levels=levels, cmap=cmap)
+    density_true = np.divide(
+        hist_true, grid.cell_area,
+        out=np.full_like(hist_true, np.nan, dtype=np.float64),
+        where=grid.simplex_mask,
+    )
+    density_pred = np.divide(
+        hist_pred, grid.cell_area,
+        out=np.full_like(hist_pred, np.nan, dtype=np.float64),
+        where=grid.simplex_mask,
+    )
+    vmax = max(float(np.nanmax(density_true)), float(np.nanmax(density_pred)))
+    vmax = max(vmax, np.finfo(float).eps)
+    mesh1 = ax1.pcolormesh(
+        grid.edges_a, grid.edges_b, density_true.T,
+        shading="flat", cmap=cmap, vmin=0.0, vmax=vmax,
+    )
     _add_simplex_overlay(ax1)
-    ax1.set_title("DNS")
+    ax1.set_title("DNS density")
     ax1.set_xlabel("Z1")
     ax1.set_ylabel("Z2")
     ax1.set_xlim(0, 1)
     ax1.set_ylim(0, 1)
 
-    ax2.contourf(z1, z2, hist_pred, levels=levels, cmap=cmap)
+    ax2.pcolormesh(
+        grid.edges_a, grid.edges_b, density_pred.T,
+        shading="flat", cmap=cmap, vmin=0.0, vmax=vmax,
+    )
     _add_simplex_overlay(ax2)
-    ax2.set_title("Dirichlet MDN")
+    ax2.set_title("Dirichlet MDN density")
     ax2.set_xlabel("Z1")
     ax2.set_xlim(0, 1)
     ax2.set_ylim(0, 1)
+    fig.colorbar(mesh1, ax=(ax1, ax2), label="probability density")
     if subtitle:
         fig.text(0.5, 0.02, subtitle, ha="center", fontsize=8)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
     return fig
 
 

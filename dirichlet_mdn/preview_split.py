@@ -57,7 +57,8 @@ def write_report(meta: pd.DataFrame, split, out_dir: Path) -> None:
     lines.append(f"- **seed:** {desc['seed']}")
     lines.append(f"- **ratios (train/val/test):** {desc['ratios']}")
     lines.append(f"- **holdout_config:** {desc['holdout_config']}")
-    lines.append(f"- **fallback:** {desc['fallback']}")
+    lines.append(f"- **grouping:** {desc['grouping']}")
+    lines.append(f"- **dataset fingerprint:** `{desc['dataset_fingerprint']}`")
     t = desc["totals"]
     pct = lambda n: f"{100*n/max(t['all'],1):.1f}%"
     lines.append(
@@ -74,14 +75,9 @@ def write_report(meta: pd.DataFrame, split, out_dir: Path) -> None:
     rows: list[list[str]] = []
     for cfg, info in sorted(desc["per_config"].items()):
         mode = info["mode"]
-        if "train_runs" in info:
-            tr = _format_runs(info["train_runs"])
-            va = _format_runs(info["val_runs"])
-            te = _format_runs(info["test_runs"])
-        else:  # by_timestep_fallback
-            tr = "ts:" + _format_runs(info.get("train_timesteps", []))
-            va = "ts:" + _format_runs(info.get("val_timesteps", []))
-            te = "ts:" + _format_runs(info.get("test_timesteps", []))
+        tr = _format_runs(info["train_runs"])
+        va = _format_runs(info["val_runs"])
+        te = _format_runs(info["test_runs"])
         lines.append(
             f"| {cfg} | {mode} | {info['n_runs']} | {info['n_rows']:,} | {tr} | {va} | {te} |"
         )
@@ -160,7 +156,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="If set, this scalar_config is the entire test set "
                         "(remaining configs split 80/20 train/val)")
     p.add_argument("--split-fallback", default="timestep",
-                   choices=("timestep", "train_only"))
+                   choices=("timestep", "train_only"),
+                   help="Deprecated compatibility option; splits never cross run IDs")
     return p
 
 

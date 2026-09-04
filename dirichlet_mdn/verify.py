@@ -4,7 +4,7 @@ Five checks, each runnable in under 30s on CPU:
 
   --check-bins                          : reconstructed bin grid == HDF5 shard
   --check-loss-gradient                 : single forward+backward, no NaN/Inf
-  --check-moment-loss-zero-on-true-params: closed-form moment algebra is correct
+  --check-moments-against-monte-carlo    : closed-form moments match samples
   --check-permutation-invariance        : NLL invariant under K-axis permutation
   --check-k1-fits-analytical-dirichlet  : K=1 MDN recovers a known Dirichlet to <2%
 
@@ -27,7 +27,6 @@ from .losses import (
     HistogramNLL,
     LossWeights,
     combined_loss,
-    moment_loss,
     stack_predicted_moments,
 )
 from .model import DirichletMDN
@@ -40,21 +39,42 @@ class CheckResult:
     detail: str
 
 
-def check_bins(parquet_path: str, hdf5_dir: str) -> CheckResult:
+def check_bins(
+    parquet_path: str,
+    hdf5_dir: str,
+    *,
+    num_bins: int = 64,
+    zst: float = 0.1,
+    uniform_bins: bool = False,
+) -> CheckResult:
     import pandas as pd
     import pyarrow.parquet as pq
     df = pq.read_table(parquet_path).to_pandas()
     shard_filename = str(df["hdf5_file"].iloc[0])
     full = f"{hdf5_dir.rstrip('/')}/{shard_filename}"
-    ok, diffs = validate_against_hdf5(full)
+    ok, diffs = validate_against_hdf5(
+        full, num_bins=num_bins, zst=zst, uniform=uniform_bins,
+    )
     detail = "max diffs: " + ", ".join(f"{k}={v}" for k, v in diffs.items())
     return CheckResult("check_bins", ok, detail)
 
 
-def check_loss_gradient(parquet_path: str, hdf5_dir: str) -> CheckResult:
-    ds = HybridPDFDataset(parquet_path, hdf5_dir, input_moments=4)
+def check_loss_gradient(
+    parquet_path: str,
+    hdf5_dir: str,
+    *,
+    num_bins: int = 64,
+    zst: float = 0.1,
+    uniform_bins: bool = False,
+) -> CheckResult:
+    ds = HybridPDFDataset(
+        parquet_path, hdf5_dir, input_moments=4,
+        num_bins=num_bins, zst=zst, uniform_bins=uniform_bins,
+    )
     try:
-        batch = collate_records([ds[i] for i in range(8)])
+        if len(ds) == 0:
+            return CheckResult("check_loss_gradient", False, "dataset is empty")
+        batch = collate_records([ds[i] for i in range(min(8, len(ds)))])
     finally:
         ds.close()
     torch.manual_seed(0)
@@ -79,31 +99,62 @@ def check_loss_gradient(parquet_path: str, hdf5_dir: str) -> CheckResult:
     return CheckResult("check_loss_gradient", True, detail)
 
 
-def check_moment_loss_zero_on_truth() -> CheckResult:
-    torch.manual_seed(1)
-    cases = []
-    for K in (1, 4, 8):
-        for n_in in (4, 5):
-            pi = torch.softmax(torch.randn(3, K), dim=-1)
-            alpha = torch.rand(3, K, 3) * 5.0 + 0.1
-            target = stack_predicted_moments(pi, alpha, n_in)
-            err = moment_loss(pi, alpha, target, n_in).item()
-            cases.append((K, n_in, err))
-    worst = max(c[2] for c in cases)
-    passed = worst < 1e-10
-    detail = ", ".join(f"K={K},n_in={n}:{e:.2e}" for K, n, e in cases)
-    return CheckResult("check_moment_loss_zero_on_truth", passed, detail)
+def check_moments_against_monte_carlo() -> CheckResult:
+    """Compare model moment formulas with independent NumPy random samples."""
+    rng = np.random.default_rng(1)
+    pi_np = np.array([0.25, 0.75], dtype=np.float64)
+    alpha_np = np.array([[2.0, 3.0, 4.0], [7.0, 2.0, 5.0]])
+    n_samples = 400_000
+    component = rng.choice(2, size=n_samples, p=pi_np)
+    samples = np.empty((n_samples, 3), dtype=np.float64)
+    for index in range(2):
+        chosen = component == index
+        samples[chosen] = rng.dirichlet(alpha_np[index], size=int(chosen.sum()))
+
+    empirical = np.array([
+        samples[:, 0].mean(),
+        samples[:, 0].var(),
+        samples[:, 1].mean(),
+        samples[:, 1].var(),
+        np.cov(samples[:, 0], samples[:, 1], ddof=0)[0, 1],
+    ])
+    predicted = stack_predicted_moments(
+        torch.tensor(pi_np, dtype=torch.float64).unsqueeze(0),
+        torch.tensor(alpha_np, dtype=torch.float64).unsqueeze(0),
+        5,
+    )[0].numpy()
+    worst = float(np.max(np.abs(predicted - empirical)))
+    return CheckResult(
+        "check_moments_against_monte_carlo",
+        worst < 2.5e-3,
+        f"max absolute moment error={worst:.3e} over {n_samples} samples",
+    )
 
 
-def check_permutation_invariance(parquet_path: str, hdf5_dir: str) -> CheckResult:
-    ds = HybridPDFDataset(parquet_path, hdf5_dir, input_moments=4)
+def check_permutation_invariance(
+    parquet_path: str,
+    hdf5_dir: str,
+    *,
+    num_bins: int = 64,
+    zst: float = 0.1,
+    uniform_bins: bool = False,
+) -> CheckResult:
+    ds = HybridPDFDataset(
+        parquet_path, hdf5_dir, input_moments=4,
+        num_bins=num_bins, zst=zst, uniform_bins=uniform_bins,
+    )
     try:
-        batch = collate_records([ds[i] for i in range(4)])
+        if len(ds) == 0:
+            return CheckResult(
+                "check_permutation_invariance", False, "dataset is empty",
+            )
+        batch = collate_records([ds[i] for i in range(min(4, len(ds)))])
         nll_mod = HistogramNLL(ds.grid)
         torch.manual_seed(2)
         K = 6
-        pi = torch.softmax(torch.randn(4, K), dim=-1)
-        alpha = torch.rand(4, K, 3) * 5.0 + 0.1
+        batch_size = batch["moments"].shape[0]
+        pi = torch.softmax(torch.randn(batch_size, K), dim=-1)
+        alpha = torch.rand(batch_size, K, 3) * 5.0 + 1.0
 
         perm = torch.tensor([3, 1, 5, 0, 4, 2])
         pi_p = pi[:, perm]
@@ -119,28 +170,15 @@ def check_permutation_invariance(parquet_path: str, hdf5_dir: str) -> CheckResul
 
 
 def _synthetic_dirichlet_histogram(grid, alpha_true: torch.Tensor) -> torch.Tensor:
-    """Build a single-Dirichlet histogram on the simplex grid.
-
-    Returns a (num_bins, num_bins) probability histogram summing to 1 over the
-    in-simplex cells (zero elsewhere).
-    """
-    from .losses import dirichlet_logpdf
-    centers_a = torch.from_numpy(grid.centers_a).to(torch.float32)
-    centers_b = torch.from_numpy(grid.centers_b).to(torch.float32)
-    grid_a = centers_a.unsqueeze(1).expand(-1, grid.num_bins)
-    grid_b = centers_b.unsqueeze(0).expand(grid.num_bins, -1)
-    z1 = grid_a.reshape(-1)
-    z2 = grid_b.reshape(-1)
-    z3 = (1.0 - z1 - z2).clamp(min=0.0)
-    z = torch.stack([z1, z2, z3], dim=-1)                        # (N*N, 3)
-    log_d = dirichlet_logpdf(z, alpha_true.expand(z.shape[0], 3)) # (N*N,)
-    d = torch.exp(log_d)
-    area = torch.from_numpy(grid.cell_area).to(torch.float32).reshape(-1)
-    mass = (d * area)
-    mask = torch.from_numpy(grid.simplex_mask).reshape(-1)
-    mass = mass * mask.to(mass.dtype)
-    hist = mass / mass.sum()
-    return hist.view(grid.num_bins, grid.num_bins)
+    """Build an independent Monte Carlo histogram from NumPy samples."""
+    rng = np.random.default_rng(3)
+    samples = rng.dirichlet(alpha_true.numpy(), size=750_000)
+    counts, _, _ = np.histogram2d(
+        samples[:, 0], samples[:, 1],
+        bins=[grid.edges_a, grid.edges_b],
+    )
+    counts[:, :] = np.where(grid.simplex_mask, counts, 0.0)
+    return torch.tensor(counts / counts.sum(), dtype=torch.float32)
 
 
 def _method_of_moments_alpha(grid, hist: torch.Tensor) -> torch.Tensor:
@@ -149,17 +187,15 @@ def _method_of_moments_alpha(grid, hist: torch.Tensor) -> torch.Tensor:
     Uses E[Z_i] and Var[Z_1] to solve for alpha_0 = E[Z_1](1 - E[Z_1]) / Var[Z_1] - 1,
     then alpha_i = alpha_0 * E[Z_i]. Returns a 3-vector. Clipped to a sane range.
     """
-    centers_a = torch.from_numpy(grid.centers_a).to(torch.float64)
-    centers_b = torch.from_numpy(grid.centers_b).to(torch.float64)
-    grid_a = centers_a.unsqueeze(1).expand(-1, grid.num_bins)
-    grid_b = centers_b.unsqueeze(0).expand(grid.num_bins, -1)
+    grid_a = torch.from_numpy(grid.cell_centroid_a).to(torch.float64)
+    grid_b = torch.from_numpy(grid.cell_centroid_b).to(torch.float64)
     p = hist.to(torch.float64)
     E1 = (p * grid_a).sum()
     E2 = (p * grid_b).sum()
     E3 = (1.0 - E1 - E2).clamp(min=1e-6)
     V1 = (p * (grid_a - E1) ** 2).sum().clamp(min=1e-8)
     a0 = (E1 * (1.0 - E1) / V1 - 1.0).clamp(min=0.5, max=1e3)
-    alpha0 = (a0 * torch.stack([E1, E2, E3])).clamp(min=0.1)
+    alpha0 = (a0 * torch.stack([E1, E2, E3])).clamp(min=1.0001)
     return alpha0.to(torch.float32)
 
 
@@ -184,18 +220,18 @@ def check_k1_fits_analytical_dirichlet(
     hist = _synthetic_dirichlet_histogram(grid, alpha_true).unsqueeze(0)  # (1, N, N)
 
     alpha_init = _method_of_moments_alpha(grid, hist[0])
-    raw = torch.nn.Parameter(torch.log(torch.expm1(alpha_init.clamp(min=1e-3))))
+    raw = torch.nn.Parameter(torch.log(torch.expm1((alpha_init - 1.0).clamp(min=1e-4))))
     pi = torch.ones(1, 1)
     opt = torch.optim.Adam([raw], lr=lr)
     last = None
     for _ in range(steps):
         opt.zero_grad()
-        alpha_pred = (torch.nn.functional.softplus(raw) + 1e-3).view(1, 1, 3)
+        alpha_pred = (torch.nn.functional.softplus(raw) + 1.0).view(1, 1, 3)
         loss = nll_mod(pi, alpha_pred, hist)
         loss.backward()
         opt.step()
         last = loss.item()
-    alpha_pred = (torch.nn.functional.softplus(raw) + 1e-3).detach()
+    alpha_pred = (torch.nn.functional.softplus(raw) + 1.0).detach()
     rel_err = ((alpha_pred - alpha_true).abs() / alpha_true).max().item()
     passed = rel_err < rel_tol
     detail = (f"alpha_true={alpha_true.tolist()}, "
@@ -205,13 +241,25 @@ def check_k1_fits_analytical_dirichlet(
     return CheckResult("check_k1_fits_analytical_dirichlet", passed, detail)
 
 
-def run_all(parquet_path: Optional[str], hdf5_dir: Optional[str]) -> List[CheckResult]:
+def run_all(
+    parquet_path: Optional[str],
+    hdf5_dir: Optional[str],
+    *,
+    num_bins: int = 64,
+    zst: float = 0.1,
+    uniform_bins: bool = False,
+) -> List[CheckResult]:
     results: List[CheckResult] = []
     if parquet_path and hdf5_dir:
-        results.append(check_bins(parquet_path, hdf5_dir))
-        results.append(check_loss_gradient(parquet_path, hdf5_dir))
-        results.append(check_permutation_invariance(parquet_path, hdf5_dir))
-    results.append(check_moment_loss_zero_on_truth())
+        grid_args = {
+            "num_bins": num_bins, "zst": zst, "uniform_bins": uniform_bins,
+        }
+        results.append(check_bins(parquet_path, hdf5_dir, **grid_args))
+        results.append(check_loss_gradient(parquet_path, hdf5_dir, **grid_args))
+        results.append(check_permutation_invariance(
+            parquet_path, hdf5_dir, **grid_args,
+        ))
+    results.append(check_moments_against_monte_carlo())
     results.append(check_k1_fits_analytical_dirichlet())
     return results
 
@@ -222,9 +270,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Path to the parquet metadata file (required for shard-bound checks)")
     p.add_argument("--hdf5-dir", default=None,
                    help="Directory containing HDF5 shards")
+    p.add_argument("--num-bins", type=int, default=64)
+    p.add_argument("--zst", type=float, default=0.1)
+    p.add_argument("--uniform-bins", action="store_true")
     p.add_argument("--check-bins", action="store_true")
     p.add_argument("--check-loss-gradient", action="store_true")
-    p.add_argument("--check-moment-loss-zero-on-true-params", action="store_true")
+    p.add_argument("--check-moments-against-monte-carlo", action="store_true")
     p.add_argument("--check-permutation-invariance", action="store_true")
     p.add_argument("--check-k1-fits-analytical-dirichlet", action="store_true")
     p.add_argument("--check-all", action="store_true", default=False)
@@ -233,30 +284,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     any_specific = any([
         args.check_bins,
         args.check_loss_gradient,
-        args.check_moment_loss_zero_on_true_params,
+        args.check_moments_against_monte_carlo,
         args.check_permutation_invariance,
         args.check_k1_fits_analytical_dirichlet,
     ])
     run_everything = args.check_all or not any_specific
 
     results: List[CheckResult] = []
+    grid_args = {
+        "num_bins": int(args.num_bins),
+        "zst": float(args.zst),
+        "uniform_bins": bool(args.uniform_bins),
+    }
     if run_everything or args.check_bins:
         if args.parquet and args.hdf5_dir:
-            results.append(check_bins(args.parquet, args.hdf5_dir))
+            results.append(check_bins(args.parquet, args.hdf5_dir, **grid_args))
         else:
             results.append(CheckResult("check_bins", False,
                                        "skipped: --parquet and --hdf5-dir required"))
     if run_everything or args.check_loss_gradient:
         if args.parquet and args.hdf5_dir:
-            results.append(check_loss_gradient(args.parquet, args.hdf5_dir))
+            results.append(check_loss_gradient(
+                args.parquet, args.hdf5_dir, **grid_args,
+            ))
         else:
             results.append(CheckResult("check_loss_gradient", False,
                                        "skipped: --parquet and --hdf5-dir required"))
-    if run_everything or args.check_moment_loss_zero_on_true_params:
-        results.append(check_moment_loss_zero_on_truth())
+    if run_everything or args.check_moments_against_monte_carlo:
+        results.append(check_moments_against_monte_carlo())
     if run_everything or args.check_permutation_invariance:
         if args.parquet and args.hdf5_dir:
-            results.append(check_permutation_invariance(args.parquet, args.hdf5_dir))
+            results.append(check_permutation_invariance(
+                args.parquet, args.hdf5_dir, **grid_args,
+            ))
         else:
             results.append(CheckResult("check_permutation_invariance", False,
                                        "skipped: --parquet and --hdf5-dir required"))

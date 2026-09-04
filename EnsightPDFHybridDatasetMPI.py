@@ -10,26 +10,29 @@ How to run (52 ranks, ct-env):
         --box-widths 64,128 --strides 32,64 \
         --output-dir hybrid_dataset_mpi
 
-Phase 1: every rank greedily processes its slice of (run_id, scalar_config)
-work units with an inflated per-bin cap and writes per-rank parquet+HDF5
-shards under output_dir/_rank/rank_NNNN/.
+Phase 1: every rank losslessly processes its slice of (run_id, scalar_config)
+work units and writes per-rank parquet+HDF5 shards under
+output_dir/_rank/rank_NNNN/.
 
 Phase 2: rank 0 streams the per-rank candidates back through the same
 decide_retention logic with the original per-bin cap and produces the final
 merged dataset. Root memory is bounded by the retained-set size (identical to
 the serial baseline), not by the total per-rank candidate volume.
 
-This file is self-contained; it does not import EnsightPDFHybridDataset (which
-crashes at module load past line 762).
+The serial entry point delegates to this implementation with one MPI rank.
 """
 
 import argparse
 import glob
+import hashlib
+import heapq
 import json
 import os
+import re
 import shutil
 import sys
 import time
+import uuid
 from collections import Counter, defaultdict
 from datetime import timedelta
 
@@ -37,8 +40,12 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from dirichlet_mdn.bin_grid import bin_grid
+from dirichlet_mdn.data import validate_dataset
+
 
 SCALAR_CONFIGS = ["I1", "I4", "I5", "L1", "PI1", "PI4", "PI5", "PL1"]
+DATASET_FORMAT_VERSION = 2
 MOMENT_NAMES = ["mean_a", "var_a", "mean_b", "var_b", "cov_ab"]
 SHAPE_NAMES = [
     "shape_entropy",
@@ -110,6 +117,12 @@ def read_ensight(file_scalar_a, file_scalar_b, nx, pad_width=32, npx=8):
         np.fromfile(handle, dtype=np.int32, count=1)
         handle.read(80)
         scalar_a = np.fromfile(handle, dtype=np.float32, count=-1)
+    expected_values = nx ** 3
+    if scalar_a.size != expected_values:
+        raise ValueError(
+            f"{file_scalar_a} contains {scalar_a.size} scalar values; "
+            f"expected {expected_values}"
+        )
 
     scalar_a = np.reshape(scalar_a, (nx_local, nx_local, nx_local, npx, npx, npx), order="F")
     scalar_a_reshaped = np.zeros((nx, nx, nx), dtype=np.float32)
@@ -128,6 +141,11 @@ def read_ensight(file_scalar_a, file_scalar_b, nx, pad_width=32, npx=8):
         np.fromfile(handle, dtype=np.int32, count=1)
         handle.read(80)
         scalar_b = np.fromfile(handle, dtype=np.float32, count=-1)
+    if scalar_b.size != expected_values:
+        raise ValueError(
+            f"{file_scalar_b} contains {scalar_b.size} scalar values; "
+            f"expected {expected_values}"
+        )
 
     scalar_b = np.reshape(scalar_b, (nx_local, nx_local, nx_local, npx, npx, npx), order="F")
     scalar_b_reshaped = np.zeros((nx, nx, nx), dtype=np.float32)
@@ -146,69 +164,19 @@ def read_ensight(file_scalar_a, file_scalar_b, nx, pad_width=32, npx=8):
     return full_scalar_a, full_scalar_b
 
 
-def get_bin_centers(num_bins, zst, non_uniform=True):
-    centers = np.zeros(num_bins, dtype=np.float64)
-
-    if non_uniform:
-        zcut = int(num_bins / 2)
-        dz = zst / float(zcut - 1)
-
-        for idx in range(0, zcut):
-            centers[idx] = float(idx) * dz
-
-        m11 = float((num_bins - 1) ** 2 - (zcut - 1) ** 2)
-        m12 = float(num_bins - zcut)
-        m21 = float(2 * (zcut - 1) + 1)
-        m22 = 1.0
-        r1 = 1.0 - zst
-        r2 = dz
-        delta = m11 * m22 - m12 * m21
-        coef_a = (+m22 * r1 - m12 * r2) / delta
-        coef_b = (-m21 * r1 + m11 * r2) / delta
-        coef_c = zst - coef_a * (zcut - 1) ** 2 - coef_b * (zcut - 1)
-        for idx in range(zcut, num_bins):
-            centers[idx] = coef_a * float(idx) ** 2 + coef_b * float(idx) + coef_c
-    else:
-        centers = np.linspace(0.0, 1.0, num_bins)
-
-    return centers
-
-
 def get_histogram_layout(num_bins, zst=0.1, non_uniform=True):
-    centers_a = get_bin_centers(num_bins, zst, non_uniform)
-    centers_b = get_bin_centers(num_bins, zst, non_uniform)
-
-    edges_a = np.zeros(num_bins + 1, dtype=np.float64)
-    edges_b = np.zeros(num_bins + 1, dtype=np.float64)
-    cell_area = np.zeros((num_bins, num_bins), dtype=np.float64)
-
-    edges_a[0] = centers_a[0] - (0.5 * centers_a[1] + 0.5 * centers_a[0] - centers_a[0])
-    edges_b[0] = centers_b[0] - (0.5 * centers_b[1] + 0.5 * centers_b[0] - centers_b[0])
-    edges_a[-1] = centers_a[-1] + (centers_a[-1] - 0.5 * centers_a[-1] - 0.5 * centers_a[-2])
-    edges_b[-1] = centers_b[-1] + (centers_b[-1] - 0.5 * centers_b[-1] - 0.5 * centers_b[-2])
-
-    for idx in range(1, len(centers_a)):
-        edges_a[idx] = 0.5 * centers_a[idx] + 0.5 * centers_a[idx - 1]
-    for idx in range(1, len(centers_b)):
-        edges_b[idx] = 0.5 * centers_b[idx] + 0.5 * centers_b[idx - 1]
-
-    for i in range(len(centers_a)):
-        for j in range(len(centers_b)):
-            cell_area[i, j] = (edges_a[i + 1] - edges_a[i]) * (edges_b[j + 1] - edges_b[j])
-
-    grid_a, grid_b = np.meshgrid(centers_a, centers_b, indexing="ij")
-    simplex_mask = (grid_a + grid_b) <= 1.0 + 1.0e-12
+    grid = bin_grid(num_bins=num_bins, zst=zst, uniform=not non_uniform)
 
     return {
-        "edges_a": edges_a,
-        "edges_b": edges_b,
-        "centers_a": centers_a,
-        "centers_b": centers_b,
-        "grid_a": grid_a,
-        "grid_b": grid_b,
-        "z1z2": grid_a * grid_b,
-        "cell_area": cell_area,
-        "simplex_mask": simplex_mask,
+        "edges_a": grid.edges_a,
+        "edges_b": grid.edges_b,
+        "centers_a": grid.centers_a,
+        "centers_b": grid.centers_b,
+        "grid_a": grid.cell_centroid_a,
+        "grid_b": grid.cell_centroid_b,
+        "z1z2": grid.cell_centroid_a * grid.cell_centroid_b,
+        "cell_area": grid.cell_area,
+        "simplex_mask": grid.simplex_mask,
     }
 
 
@@ -231,7 +199,68 @@ def compute_histogram_pdf(z1_values, z2_values, layout):
     total = counts.sum()
     if total <= 0.0:
         raise ValueError("Histogram count total must be positive")
+    if int(total) != int(z1_values.size):
+        raise ValueError(
+            f"histogram dropped {int(z1_values.size - total)} validated scalar pairs"
+        )
+    outside_count = int(counts[~layout["simplex_mask"]].sum())
+    if outside_count:
+        raise ValueError(
+            f"histogram assigned {outside_count} validated scalar pairs to "
+            "zero-area cells outside the simplex"
+        )
     return counts / total
+
+
+def prepare_scalar_samples(z1_values, z2_values, tolerance=1e-6, policy="error"):
+    """Validate and tolerance-correct one filter cell before using its values."""
+    if tolerance < 0.0:
+        raise ValueError("scalar tolerance must be non-negative")
+    if policy not in ("error", "drop"):
+        raise ValueError("invalid scalar policy must be 'error' or 'drop'")
+
+    z1 = np.asarray(z1_values, dtype=np.float64).reshape(-1)
+    z2 = np.asarray(z2_values, dtype=np.float64).reshape(-1)
+    if z1.shape != z2.shape:
+        raise ValueError("paired scalar arrays must have the same shape")
+    finite = np.isfinite(z1) & np.isfinite(z2)
+    physical = (
+        (z1 >= -tolerance)
+        & (z1 <= 1.0 + tolerance)
+        & (z2 >= -tolerance)
+        & (z2 <= 1.0 + tolerance)
+        & ((z1 + z2) <= 1.0 + tolerance)
+    )
+    valid = finite & physical
+    invalid_count = int((~valid).sum())
+    if invalid_count and policy == "error":
+        raise ValueError(
+            f"filter cell contains {invalid_count}/{z1.size} non-finite or "
+            "non-physical scalar pairs"
+        )
+    if policy == "drop":
+        z1 = z1[valid]
+        z2 = z2[valid]
+    if z1.size == 0:
+        raise ValueError("filter cell contains no valid scalar pairs")
+
+    original_z1 = z1.copy()
+    original_z2 = z2.copy()
+    z1 = np.clip(z1, 0.0, 1.0)
+    z2 = np.clip(z2, 0.0, 1.0)
+    pair_sum = z1 + z2
+    over = pair_sum > 1.0
+    z1[over] /= pair_sum[over]
+    z2[over] /= pair_sum[over]
+    adjusted_count = int(
+        np.count_nonzero((z1 != original_z1) | (z2 != original_z2))
+    )
+    return z1, z2, {
+        "scalar_pairs_raw": int(np.asarray(z1_values).size),
+        "scalar_pairs_invalid": invalid_count,
+        "scalar_pairs_adjusted": adjusted_count,
+        "scalar_pairs_used": int(z1.size),
+    }
 
 
 def compute_histogram_moments(pdf, layout):
@@ -411,7 +440,22 @@ def decide_retention(pdf, metadata, bin_indices, bin_source_counts, selected_pdf
     return False, None, min_distance, "bin_full"
 
 
-def iter_filter_records(scalar_a, scalar_b, nx, pad_width, box_width, stride, layout, shape_masks, run_id, scalar_config, timestep):
+def iter_filter_records(
+    scalar_a,
+    scalar_b,
+    nx,
+    pad_width,
+    box_width,
+    stride,
+    layout,
+    shape_masks,
+    run_id,
+    scalar_config,
+    timestep,
+    scalar_tolerance=1e-6,
+    invalid_scalar_policy="error",
+    max_moment_discrepancy=0.05,
+):
     half_width = box_width // 2
     ranges = [
         range(pad_width, nx + pad_width, stride),
@@ -426,11 +470,23 @@ def iter_filter_records(scalar_a, scalar_b, nx, pad_width, box_width, stride, la
             center_k - half_width:center_k + half_width,
         ]
 
-        z1_values = np.ravel(scalar_a[block]).astype(np.float64)
-        z2_values = np.ravel(scalar_b[block]).astype(np.float64)
+        z1_values, z2_values, scalar_stats = prepare_scalar_samples(
+            scalar_a[block],
+            scalar_b[block],
+            tolerance=scalar_tolerance,
+            policy=invalid_scalar_policy,
+        )
         direct_moments = compute_direct_moments(z1_values, z2_values)
         pdf = compute_histogram_pdf(z1_values, z2_values, layout)
         hist_moments = compute_histogram_moments(pdf, layout)
+        moment_abs_err_max = float(np.max(
+            np.abs(np.asarray(direct_moments) - np.asarray(hist_moments))
+        ))
+        if moment_abs_err_max > max_moment_discrepancy:
+            raise ValueError(
+                "direct and histogram moments disagree: "
+                f"{moment_abs_err_max:.6g} > {max_moment_discrepancy:.6g}"
+            )
         shape_features = compute_shape_features(pdf, shape_masks)
 
         metadata = {
@@ -442,7 +498,7 @@ def iter_filter_records(scalar_a, scalar_b, nx, pad_width, box_width, stride, la
             "center_i": int(center_i - pad_width),
             "center_j": int(center_j - pad_width),
             "center_k": int(center_k - pad_width),
-            "n_dns_cells": int(box_width ** 3),
+            "n_dns_cells": int(z1_values.size),
             "mean_a": float(direct_moments[0]),
             "var_a": float(direct_moments[1]),
             "mean_b": float(direct_moments[2]),
@@ -453,8 +509,9 @@ def iter_filter_records(scalar_a, scalar_b, nx, pad_width, box_width, stride, la
             "hist_mean_b": float(hist_moments[2]),
             "hist_var_b": float(hist_moments[3]),
             "hist_cov_ab": float(hist_moments[4]),
-            "moment_abs_err_max": float(np.max(np.abs(np.asarray(direct_moments) - np.asarray(hist_moments)))),
+            "moment_abs_err_max": moment_abs_err_max,
         }
+        metadata.update(scalar_stats)
         metadata.update(shape_features)
         yield metadata, pdf.astype(np.float32)
 
@@ -474,6 +531,7 @@ def write_hdf5_shards(output_dir, dataset_tag, histograms, metadata_df, layout, 
 
         with h5py.File(shard_path, "w") as handle:
             handle.attrs["dataset_tag"] = dataset_tag
+            handle.attrs["format_version"] = DATASET_FORMAT_VERSION
             handle.attrs["num_samples"] = end - start
             handle.attrs["num_bins_a"] = shard_histograms.shape[1]
             handle.attrs["num_bins_b"] = shard_histograms.shape[2]
@@ -483,6 +541,8 @@ def write_hdf5_shards(output_dir, dataset_tag, histograms, metadata_df, layout, 
             bins_group.create_dataset("edges_b", data=layout["edges_b"])
             bins_group.create_dataset("centers_a", data=layout["centers_a"])
             bins_group.create_dataset("centers_b", data=layout["centers_b"])
+            bins_group.create_dataset("cell_centroid_a", data=layout["grid_a"])
+            bins_group.create_dataset("cell_centroid_b", data=layout["grid_b"])
             bins_group.create_dataset("simplex_mask", data=layout["simplex_mask"].astype(np.uint8))
             bins_group.create_dataset("cell_area", data=layout["cell_area"])
 
@@ -503,10 +563,9 @@ def write_hdf5_shards(output_dir, dataset_tag, histograms, metadata_df, layout, 
 def remove_existing_shards(output_dir, dataset_tag):
     if not os.path.isdir(output_dir):
         return
-    prefix = f"{dataset_tag}_"
-    suffix = ".h5"
+    pattern = re.compile(rf"^{re.escape(dataset_tag)}_[0-9]{{4,}}\.h5$")
     for entry in os.listdir(output_dir):
-        if entry.startswith(prefix) and entry.endswith(suffix):
+        if pattern.fullmatch(entry):
             os.remove(os.path.join(output_dir, entry))
 
 
@@ -535,11 +594,14 @@ def materialize_dataset(output_dir, dataset_tag, selected_pdfs, selected_metadat
         return None
 
     os.makedirs(output_dir, exist_ok=True)
-    remove_existing_shards(output_dir, dataset_tag)
+    staging_dir = os.path.join(
+        output_dir, f".{dataset_tag}.staging-{uuid.uuid4().hex}",
+    )
+    os.makedirs(staging_dir)
     temp_metadata = pd.DataFrame(selected_metadata)
     temp_metadata.insert(0, "sample_id", np.arange(len(temp_metadata), dtype=np.int64))
     shard_paths = write_hdf5_shards(
-        output_dir,
+        staging_dir,
         dataset_tag,
         selected_pdfs,
         temp_metadata,
@@ -549,11 +611,13 @@ def materialize_dataset(output_dir, dataset_tag, selected_pdfs, selected_metadat
     )
 
     metadata_df = build_metadata_frame(selected_metadata, shard_paths, args.hdf5_shard_size)
-    metadata_path = os.path.join(output_dir, f"{dataset_tag}_metadata.parquet")
+    metadata_path = os.path.join(staging_dir, f"{dataset_tag}_metadata.parquet")
     metadata_df.to_parquet(metadata_path, index=False)
 
     manifest = {
         "dataset_tag": dataset_tag,
+        "format_version": DATASET_FORMAT_VERSION,
+        "simplex_geometry": "rectangle_intersection_area_and_centroid",
         "input_folder": fdir,
         "input_layout": "run_00**/ensight-3D/ZA* and ZB*",
         "metadata_path": os.path.basename(metadata_path),
@@ -573,6 +637,9 @@ def materialize_dataset(output_dir, dataset_tag, selected_pdfs, selected_metadat
         "moment_bins": parse_int_spec(args.moment_bins),
         "max_per_moment_bin": args.max_per_moment_bin,
         "shape_threshold": args.shape_threshold,
+        "scalar_tolerance": args.scalar_tolerance,
+        "invalid_scalar_policy": args.invalid_scalar_policy,
+        "max_moment_discrepancy": args.max_moment_discrepancy,
         "counts": dict(counters),
         "num_retained": int(len(metadata_df)),
         "missing_paths": missing_paths,
@@ -581,11 +648,32 @@ def materialize_dataset(output_dir, dataset_tag, selected_pdfs, selected_metadat
     }
     if extra_manifest:
         manifest.update(extra_manifest)
-    manifest_path = os.path.join(output_dir, f"{dataset_tag}_manifest.json")
+    manifest_path = os.path.join(staging_dir, f"{dataset_tag}_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
 
-    return metadata_path, shard_paths, manifest_path, len(metadata_df)
+    final_manifest = os.path.join(output_dir, os.path.basename(manifest_path))
+    final_metadata = os.path.join(output_dir, os.path.basename(metadata_path))
+    final_shards = [
+        os.path.join(output_dir, os.path.basename(path))
+        for path in shard_paths
+    ]
+    # The manifest is the commit marker. Remove the old marker first, publish
+    # every data file with atomic same-filesystem renames, and publish the new
+    # marker last. Readers can therefore never mistake a partial write for a
+    # complete current dataset.
+    try:
+        if os.path.exists(final_manifest):
+            os.remove(final_manifest)
+        remove_existing_shards(output_dir, dataset_tag)
+        for staged, final in zip(shard_paths, final_shards):
+            os.replace(staged, final)
+        os.replace(metadata_path, final_metadata)
+        os.replace(manifest_path, final_manifest)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    return final_metadata, final_shards, final_manifest, len(metadata_df)
 
 
 def build_arg_parser():
@@ -616,12 +704,16 @@ def build_arg_parser():
     parser.add_argument("--hdf5-shard-size", dest="hdf5_shard_size", type=int, default=25000, help="Maximum number of samples per HDF5 shard")
     parser.add_argument("--compression", dest="compression", type=str, default="gzip", help="HDF5 compression filter name")
     parser.add_argument("--strict-missing", dest="strict_missing", action="store_true", help="Abort on the first missing Ensight folder or file")
-    parser.add_argument("--per-rank-cap-multiplier", dest="per_rank_cap_multiplier", type=int, default=2, help="Phase-1 per-rank bin cap = max_per_moment_bin * this. 1=tightest, 2=safe, 3=loose.")
+    parser.add_argument("--scalar-tolerance", dest="scalar_tolerance", type=float, default=1e-6, help="Tolerance for tiny scalar bound/simplex roundoff before correction")
+    parser.add_argument("--invalid-scalar-policy", dest="invalid_scalar_policy", choices=("error", "drop"), default="error", help="Reject a filter cell with materially invalid scalar pairs, or explicitly drop and count them")
+    parser.add_argument("--max-moment-discrepancy", dest="max_moment_discrepancy", type=float, default=0.05, help="Maximum allowed direct-vs-histogram moment difference")
+    parser.add_argument("--per-rank-cap-multiplier", dest="per_rank_cap_multiplier", type=int, default=2, help="Deprecated compatibility option; phase 1 is now lossless")
     parser.add_argument("--rank-output-subdir", dest="rank_output_subdir", type=str, default="_rank", help="Subdirectory under --output-dir holding per-rank phase-1 outputs")
     parser.add_argument("--keep-rank-outputs", dest="keep_rank_outputs", action="store_true", help="Keep per-rank phase-1 outputs after the final dataset is written")
     parser.add_argument("--rank-dataset-tag", dest="rank_dataset_tag", type=str, default="rank_phase1", help="Dataset tag used for per-rank phase-1 outputs")
     parser.add_argument("--skip-phase1", dest="skip_phase1", action="store_true", help="Skip phase 1 and only run the merge over an existing _rank/ tree. Run with `python ...` (no mpirun needed).")
     parser.add_argument("--merge-progress-every", dest="merge_progress_every", type=int, default=10000, help="Print merge progress every N candidates. Set 0 to disable.")
+    parser.add_argument("--selection-seed", dest="selection_seed", type=int, default=0, help="Seed for deterministic hash ordering during global diversity selection")
     return parser
 
 
@@ -635,6 +727,165 @@ def enumerate_work_units(run_ids, scalar_configs):
 
 def partition_work_units(units, rank, size):
     return [unit for index, unit in enumerate(units) if index % size == rank]
+
+
+def phase1_configuration(
+    args,
+    *,
+    fdir,
+    run_ids,
+    scalar_configs,
+    box_widths,
+    stride_values,
+):
+    return {
+        "format_version": DATASET_FORMAT_VERSION,
+        "input_folder": os.path.realpath(fdir),
+        "run_ids": [int(value) for value in run_ids],
+        "scalar_configs": [str(value) for value in scalar_configs],
+        "box_widths": [int(value) for value in box_widths],
+        "strides": [int(value) for value in stride_values],
+        "timesteps": [int(args.tstart), int(args.tend), int(args.tjump)],
+        "nx": int(args.nx),
+        "npx": int(args.npx),
+        "pdf_bins": int(args.pdf_bins),
+        "zst": float(args.zst),
+        "uniform_bins": bool(args.uniform_bins),
+        "moment_bins": parse_int_spec(args.moment_bins),
+        "variance_limit": float(args.variance_limit),
+        "covariance_limit": float(args.covariance_limit),
+        "shape_threshold": float(args.shape_threshold),
+        "corner_threshold": float(args.corner_threshold),
+        "edge_threshold": float(args.edge_threshold),
+        "center_radius": float(args.center_radius),
+        "scalar_tolerance": float(args.scalar_tolerance),
+        "invalid_scalar_policy": str(args.invalid_scalar_policy),
+        "max_moment_discrepancy": float(args.max_moment_discrepancy),
+        "strict_missing": bool(args.strict_missing),
+        "lossless_phase1": True,
+    }
+
+
+def configuration_signature(configuration):
+    payload = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validate_rank_outputs(
+    rank_dirs,
+    rank_dataset_tag,
+    expected_signature,
+    *,
+    expected_size=None,
+    expected_work_units=None,
+):
+    """Reject stale, missing, extra, or incompatible phase-1 rank outputs."""
+    if not rank_dirs:
+        raise RuntimeError("no phase-1 rank directories were found")
+    actual_ranks = []
+    actual_work_units = []
+    for rank_dir in rank_dirs:
+        match = re.fullmatch(r"rank_([0-9]{4})", os.path.basename(rank_dir))
+        if not match:
+            raise RuntimeError(f"invalid rank directory name: {rank_dir}")
+        rank_number = int(match.group(1))
+        actual_ranks.append(rank_number)
+        manifest_path = os.path.join(
+            rank_dir, f"{rank_dataset_tag}_manifest.json",
+        )
+        if not os.path.isfile(manifest_path):
+            raise RuntimeError(f"missing rank manifest: {manifest_path}")
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("format_version") != DATASET_FORMAT_VERSION:
+            raise RuntimeError(f"incompatible dataset format in {manifest_path}")
+        if manifest.get("phase1_signature") != expected_signature:
+            raise RuntimeError(
+                f"phase-1 configuration mismatch in {manifest_path}; "
+                "rerun phase 1 with the current arguments"
+            )
+        if manifest.get("mpi_rank") != rank_number:
+            raise RuntimeError(f"rank identity mismatch in {manifest_path}")
+        if not manifest.get("lossless_phase1", False):
+            raise RuntimeError(f"lossy phase-1 output is not accepted: {manifest_path}")
+        work_units = [
+            (int(unit[0]), str(unit[1]))
+            for unit in manifest.get("rank_work_units", [])
+        ]
+        actual_work_units.extend(work_units)
+        retained = int(manifest.get("num_retained", 0))
+        collected = int(
+            manifest.get("counts", {}).get("phase1_candidates_collected", 0)
+        )
+        if retained != collected:
+            raise RuntimeError(
+                f"lossless candidate count mismatch in {manifest_path}: "
+                f"manifest={retained}, collected={collected}"
+            )
+        if retained > 0:
+            parquet_path = os.path.join(
+                rank_dir, f"{rank_dataset_tag}_metadata.parquet",
+            )
+            if not os.path.isfile(parquet_path):
+                raise RuntimeError(f"missing rank metadata: {parquet_path}")
+            rank_meta = pd.read_parquet(
+                parquet_path, columns=["sample_id", "hdf5_file"],
+            )
+            if len(rank_meta) != retained:
+                raise RuntimeError(
+                    f"rank metadata count mismatch in {parquet_path}: "
+                    f"{len(rank_meta)} != {retained}"
+                )
+            if rank_meta["sample_id"].duplicated().any():
+                raise RuntimeError(
+                    f"rank metadata has duplicate sample IDs: {parquet_path}"
+                )
+            expected_shards = set(rank_meta["hdf5_file"].astype(str))
+            shard_pattern = re.compile(
+                rf"^{re.escape(rank_dataset_tag)}_[0-9]{{4,}}\.h5$"
+            )
+            actual_shards = {
+                name for name in os.listdir(rank_dir)
+                if shard_pattern.fullmatch(name)
+            }
+            if actual_shards != expected_shards:
+                raise RuntimeError(
+                    f"rank shard set does not match metadata in {rank_dir}"
+                )
+        else:
+            parquet_path = os.path.join(
+                rank_dir, f"{rank_dataset_tag}_metadata.parquet",
+            )
+            shard_pattern = re.compile(
+                rf"^{re.escape(rank_dataset_tag)}_[0-9]{{4,}}\.h5$"
+            )
+            stale_shards = [
+                name for name in os.listdir(rank_dir)
+                if shard_pattern.fullmatch(name)
+            ]
+            if os.path.exists(parquet_path) or stale_shards:
+                raise RuntimeError(
+                    f"empty rank output contains stale data files: {rank_dir}"
+                )
+
+    actual_ranks = sorted(actual_ranks)
+    inferred_size = len(actual_ranks) if expected_size is None else expected_size
+    expected_ranks = list(range(inferred_size))
+    if actual_ranks != expected_ranks:
+        raise RuntimeError(
+            f"phase-1 rank set mismatch: expected {expected_ranks}, "
+            f"found {actual_ranks}"
+        )
+    if expected_work_units is not None:
+        expected_units = sorted(
+            (int(run_id), str(config))
+            for run_id, config in expected_work_units
+        )
+        if sorted(actual_work_units) != expected_units:
+            raise RuntimeError(
+                "phase-1 work-unit coverage is incomplete, duplicated, or stale"
+            )
+    return inferred_size
 
 
 def process_work_units_on_rank(
@@ -652,13 +903,10 @@ def process_work_units_on_rank(
     per_rank_cap,
     rank_output_dir,
 ):
-    """Run the existing single-pass greedy on this rank's slice of work units."""
+    """Collect every candidate from this rank without lossy local pruning."""
     width_stride_pairs = list(zip(box_widths, stride_values))
     selected_metadata = []
     selected_pdfs = []
-    selected_bin_keys = []
-    bin_to_indices = defaultdict(list)
-    bin_source_counts = defaultdict(Counter)
     counters = Counter()
     missing_paths = []
 
@@ -710,55 +958,35 @@ def process_work_units_on_rank(
                 for metadata, pdf in iter_filter_records(
                     scalar_a, scalar_b, args.nx, pad_width, box_width, stride,
                     layout, shape_masks, run_id, scalar_config, timestep,
+                    scalar_tolerance=args.scalar_tolerance,
+                    invalid_scalar_policy=args.invalid_scalar_policy,
+                    max_moment_discrepancy=args.max_moment_discrepancy,
                 ):
                     counters["raw_records"] += 1
+                    counters["scalar_pairs_raw"] += metadata["scalar_pairs_raw"]
+                    counters["scalar_pairs_invalid"] += metadata["scalar_pairs_invalid"]
+                    counters["scalar_pairs_adjusted"] += metadata["scalar_pairs_adjusted"]
+                    counters["scalar_pairs_used"] += metadata["scalar_pairs_used"]
+                    if metadata["scalar_pairs_invalid"]:
+                        counters["records_with_invalid_pairs"] += 1
+                    if metadata["scalar_pairs_adjusted"]:
+                        counters["records_with_adjusted_pairs"] += 1
                     moment_values = tuple(metadata[name] for name in MOMENT_NAMES)
                     bin_key = compute_moment_bin(
                         moment_values, moment_bin_counts,
                         args.variance_limit, args.covariance_limit,
                     )
-                    keep, replace_index, min_distance, reason = decide_retention(
-                        pdf, metadata,
-                        bin_to_indices[bin_key], bin_source_counts[bin_key], selected_pdfs,
-                        per_rank_cap, args.shape_threshold,
-                    )
-
                     metadata["moment_bin_0"] = int(bin_key[0])
                     metadata["moment_bin_1"] = int(bin_key[1])
                     metadata["moment_bin_2"] = int(bin_key[2])
                     metadata["moment_bin_3"] = int(bin_key[3])
                     metadata["moment_bin_4"] = int(bin_key[4])
                     metadata["moment_bin_key"] = "-".join(str(item) for item in bin_key)
-                    metadata["shape_novelty"] = float(min_distance)
-                    metadata["retain_reason"] = reason
-
-                    if not keep:
-                        counters[f"discard_{reason}"] += 1
-                        continue
-
-                    source_key = (metadata["scalar_config"], metadata["run_id"], metadata["timestep"], metadata["box_width"])
-                    if replace_index is None:
-                        selected_metadata.append(metadata)
-                        selected_pdfs.append(pdf)
-                        selected_bin_keys.append(bin_key)
-                        new_index = len(selected_metadata) - 1
-                        bin_to_indices[bin_key].append(new_index)
-                    else:
-                        old_bin_key = selected_bin_keys[replace_index]
-                        old_metadata = selected_metadata[replace_index]
-                        old_source_key = (
-                            old_metadata["scalar_config"], old_metadata["run_id"],
-                            old_metadata["timestep"], old_metadata["box_width"],
-                        )
-                        bin_source_counts[old_bin_key][old_source_key] -= 1
-                        if bin_source_counts[old_bin_key][old_source_key] <= 0:
-                            del bin_source_counts[old_bin_key][old_source_key]
-                        selected_metadata[replace_index] = metadata
-                        selected_pdfs[replace_index] = pdf
-                        selected_bin_keys[replace_index] = bin_key
-
-                    bin_source_counts[bin_key][source_key] += 1
-                    counters[f"keep_{reason}"] += 1
+                    metadata["shape_novelty"] = 1.0
+                    metadata["retain_reason"] = "phase1_lossless"
+                    selected_metadata.append(metadata)
+                    selected_pdfs.append(pdf)
+                    counters["phase1_candidates_collected"] += 1
 
     return selected_metadata, selected_pdfs, counters, missing_paths
 
@@ -781,21 +1009,30 @@ def write_rank_outputs(
     rank_work_units,
     start_time,
     per_rank_cap,
+    phase1_config,
+    phase1_signature,
 ):
     os.makedirs(rank_output_dir, exist_ok=True)
     extra = {
         "mpi_rank": int(rank),
         "rank_work_units": [list(unit) for unit in rank_work_units],
         "per_rank_cap": int(per_rank_cap),
+        "phase1_configuration": phase1_config,
+        "phase1_signature": phase1_signature,
+        "lossless_phase1": True,
     }
 
     if not selected_metadata:
         # Still write an empty manifest so the merger knows the rank ran.
         manifest = {
             "dataset_tag": rank_dataset_tag,
+            "format_version": DATASET_FORMAT_VERSION,
             "mpi_rank": int(rank),
             "rank_work_units": [list(unit) for unit in rank_work_units],
             "per_rank_cap": int(per_rank_cap),
+            "phase1_configuration": phase1_config,
+            "phase1_signature": phase1_signature,
+            "lossless_phase1": True,
             "num_retained": 0,
             "counts": dict(counters),
             "missing_paths": missing_paths,
@@ -828,54 +1065,164 @@ def write_rank_outputs(
     return result[3] if result is not None else 0
 
 
-def iter_rank_candidates(rank_dirs, rank_dataset_tag):
-    """Yield (metadata_dict, pdf_array) from per-rank outputs in rank order, then in
-    each rank's original arrival order.
+def _physical_candidate_key(metadata):
+    return (
+        int(metadata["run_id"]),
+        str(metadata["scalar_config"]),
+        int(metadata["timestep"]),
+        int(metadata["box_width"]),
+        int(metadata["center_i"]),
+        int(metadata["center_j"]),
+        int(metadata["center_k"]),
+    )
 
-    Per-rank PDFs are bulk-loaded into RAM (one decompress per shard) and metadata
-    is materialized once via to_dict(orient='records'), then iterated as plain
-    Python. This avoids pd.iterrows() and per-candidate h5py reads, both of which
-    were the dominant cost in the merge.
-    """
+
+def _candidate_sort_key(metadata, selection_seed=0):
+    physical_key = _physical_candidate_key(metadata)
+    payload = json.dumps(
+        [int(selection_seed), *physical_key],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (hashlib.sha256(payload).digest(), physical_key)
+
+
+def _iter_one_rank_candidates(
+    rank_dir,
+    rank_dataset_tag,
+    selection_seed=0,
+    expected_num_bins=None,
+):
+    """Yield one rank's candidates in deterministic hash order."""
     drop_cols_final = {"sample_id", "shard_id", "local_index", "hdf5_file"}
     stale_cols = ("moment_bin_0", "moment_bin_1", "moment_bin_2", "moment_bin_3",
                   "moment_bin_4", "moment_bin_key", "shape_novelty", "retain_reason")
     int_cols = ("run_id", "timestep", "box_width", "stride",
                 "center_i", "center_j", "center_k", "n_dns_cells")
 
-    for rank_dir in rank_dirs:
-        parquet_path = os.path.join(rank_dir, f"{rank_dataset_tag}_metadata.parquet")
-        if not os.path.isfile(parquet_path):
+    parquet_path = os.path.join(rank_dir, f"{rank_dataset_tag}_metadata.parquet")
+    if not os.path.isfile(parquet_path):
+        return
+    meta_df = pd.read_parquet(parquet_path)
+    if meta_df.empty:
+        return
+    if meta_df["sample_id"].duplicated().any():
+        raise RuntimeError(f"duplicate rank sample IDs in {parquet_path}")
+    if meta_df.duplicated(subset=["hdf5_file", "local_index"]).any():
+        raise RuntimeError(f"duplicate rank HDF5 row mappings in {parquet_path}")
+
+    cols_to_drop = [c for c in stale_cols if c in meta_df.columns]
+    if cols_to_drop:
+        meta_df = meta_df.drop(columns=cols_to_drop)
+    for col in int_cols:
+        if col in meta_df.columns:
+            meta_df[col] = meta_df[col].astype(int)
+    meta_df["scalar_config"] = meta_df["scalar_config"].astype(str)
+    meta_df["_selection_key"] = [
+        _candidate_sort_key(record, selection_seed)[0].hex()
+        for record in meta_df.to_dict(orient="records")
+    ]
+    meta_df = meta_df.sort_values(
+        ["_selection_key", "run_id", "scalar_config", "timestep", "box_width",
+         "center_i", "center_j", "center_k"],
+        kind="stable",
+    ).drop(columns="_selection_key").reset_index(drop=True)
+
+    hdf5_file_col = meta_df["hdf5_file"].astype(str).to_numpy()
+    local_index_col = meta_df["local_index"].astype(int).to_numpy()
+    sample_id_col = meta_df["sample_id"].astype(int).to_numpy()
+    keep_cols = [column for column in meta_df.columns if column not in drop_cols_final]
+    records = meta_df[keep_cols].to_dict(orient="records")
+    handles = {}
+    try:
+        for index, metadata in enumerate(records):
+            shard_name = hdf5_file_col[index]
+            handle = handles.get(shard_name)
+            if handle is None:
+                handle = h5py.File(os.path.join(rank_dir, shard_name), "r")
+                if handle.attrs.get("format_version") != DATASET_FORMAT_VERSION:
+                    handle.close()
+                    raise RuntimeError(f"incompatible rank shard: {shard_name}")
+                if "bins/cell_centroid_a" not in handle or "bins/cell_centroid_b" not in handle:
+                    handle.close()
+                    raise RuntimeError(
+                        f"rank shard lacks clipped-simplex geometry: {shard_name}"
+                    )
+                histograms = handle["data/histograms"]
+                if "data/sample_id" not in handle or "data/local_index" not in handle:
+                    handle.close()
+                    raise RuntimeError(
+                        f"rank shard lacks row identity arrays: {shard_name}"
+                    )
+                if (
+                    histograms.ndim != 3
+                    or (
+                        expected_num_bins is not None
+                        and histograms.shape[1:] != (
+                            expected_num_bins, expected_num_bins,
+                        )
+                    )
+                ):
+                    handle.close()
+                    raise RuntimeError(
+                        f"rank shard histogram shape is incompatible: "
+                        f"{shard_name} {histograms.shape}"
+                    )
+                handles[shard_name] = handle
+            if not 0 <= local_index_col[index] < handle["data/histograms"].shape[0]:
+                raise RuntimeError(
+                    f"rank metadata local_index is out of range in {shard_name}"
+                )
+            local_index = local_index_col[index]
+            if (
+                int(handle["data/sample_id"][local_index])
+                != sample_id_col[index]
+                or int(handle["data/local_index"][local_index]) != local_index
+            ):
+                raise RuntimeError(
+                    f"rank HDF5 row identity disagrees with metadata in {shard_name}"
+                )
+            pdf = np.asarray(
+                handle["data/histograms"][local_index], dtype=np.float32,
+            )
+            yield _candidate_sort_key(metadata, selection_seed), metadata, pdf
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
+def iter_rank_candidates(
+    rank_dirs,
+    rank_dataset_tag,
+    selection_seed=0,
+    expected_num_bins=None,
+):
+    """K-way merge candidates into rank-count-independent hash order."""
+    iterators = [
+        iter(_iter_one_rank_candidates(
+            rank_dir, rank_dataset_tag, selection_seed=selection_seed,
+            expected_num_bins=expected_num_bins,
+        ))
+        for rank_dir in rank_dirs
+    ]
+    heap = []
+    for rank_index, iterator in enumerate(iterators):
+        try:
+            key, metadata, pdf = next(iterator)
+        except StopIteration:
             continue
-        meta_df = pd.read_parquet(parquet_path)
-        if meta_df.empty:
+        heapq.heappush(heap, (key, rank_index, metadata, pdf, iterator))
+
+    while heap:
+        _, rank_index, metadata, pdf, iterator = heapq.heappop(heap)
+        yield metadata, pdf
+        try:
+            key, next_metadata, next_pdf = next(iterator)
+        except StopIteration:
             continue
-
-        cols_to_drop = [c for c in stale_cols if c in meta_df.columns]
-        if cols_to_drop:
-            meta_df = meta_df.drop(columns=cols_to_drop)
-        for col in int_cols:
-            if col in meta_df.columns:
-                meta_df[col] = meta_df[col].astype(int)
-        meta_df["scalar_config"] = meta_df["scalar_config"].astype(str)
-
-        hdf5_file_col = meta_df["hdf5_file"].astype(str).to_numpy()
-        local_index_col = meta_df["local_index"].astype(int).to_numpy()
-
-        shard_names = sorted(set(hdf5_file_col.tolist()))
-        shard_pdfs = {}
-        for name in shard_names:
-            with h5py.File(os.path.join(rank_dir, name), "r") as handle:
-                shard_pdfs[name] = handle["data"]["histograms"][:].astype(np.float32, copy=False)
-
-        keep_cols = [c for c in meta_df.columns if c not in drop_cols_final]
-        records = meta_df[keep_cols].to_dict(orient="records")
-
-        for i, metadata in enumerate(records):
-            pdf = shard_pdfs[hdf5_file_col[i]][local_index_col[i]]
-            yield metadata, pdf
-
-        shard_pdfs.clear()
+        heapq.heappush(
+            heap,
+            (key, rank_index, next_metadata, next_pdf, iterator),
+        )
 
 
 def merge_per_rank_outputs(
@@ -899,6 +1246,7 @@ def merge_per_rank_outputs(
     bin_source_counts = defaultdict(Counter)
     bin_novelties = {}
     counters = Counter()
+    candidate_source_counts = Counter()
 
     max_per_bin = int(args.max_per_moment_bin)
     shape_threshold = float(args.shape_threshold)
@@ -906,7 +1254,10 @@ def merge_per_rank_outputs(
     last_print_time = merge_start
     last_print_seen = 0
 
-    for metadata, pdf in iter_rank_candidates(rank_dirs, rank_dataset_tag):
+    for metadata, pdf in iter_rank_candidates(
+        rank_dirs, rank_dataset_tag, selection_seed=args.selection_seed,
+        expected_num_bins=int(args.pdf_bins),
+    ):
         counters["candidates_seen"] += 1
         moment_values = tuple(metadata[name] for name in MOMENT_NAMES)
         bin_key = compute_moment_bin(
@@ -920,6 +1271,7 @@ def merge_per_rank_outputs(
             metadata["scalar_config"], metadata["run_id"],
             metadata["timestep"], metadata["box_width"],
         )
+        candidate_source_counts[source_key] += 1
         unseen_source = source_counts[source_key] == 0
 
         metadata["moment_bin_0"] = int(bin_key[0])
@@ -1018,6 +1370,25 @@ def merge_per_rank_outputs(
             last_print_time = now
             last_print_seen = seen
 
+    retained_source_counts = Counter(
+        (
+            metadata["scalar_config"], metadata["run_id"],
+            metadata["timestep"], metadata["box_width"],
+        )
+        for metadata in selected_metadata
+    )
+    for metadata in selected_metadata:
+        source_key = (
+            metadata["scalar_config"], metadata["run_id"],
+            metadata["timestep"], metadata["box_width"],
+        )
+        candidates = candidate_source_counts[source_key]
+        retained = retained_source_counts[source_key]
+        metadata["source_candidate_count"] = int(candidates)
+        metadata["source_retained_count"] = int(retained)
+        metadata["source_retention_fraction"] = float(retained / candidates)
+        metadata["source_inverse_retention_weight"] = float(candidates / retained)
+
     return selected_metadata, selected_pdfs, counters
 
 
@@ -1065,6 +1436,18 @@ def main():
 
     if args.per_rank_cap_multiplier < 1:
         raise ValueError("--per-rank-cap-multiplier must be >= 1")
+    if args.nx <= 0 or args.npx <= 0 or args.nx % args.npx != 0:
+        raise ValueError("--nx and --npx must be positive and nx must be divisible by npx")
+    if args.tjump <= 0 or args.tend <= args.tstart:
+        raise ValueError("timesteps require --tjump > 0 and --tend > --tstart")
+    if args.max_per_moment_bin <= 0 or args.hdf5_shard_size <= 0:
+        raise ValueError("moment-bin and HDF5 shard caps must be positive")
+    if args.variance_limit <= 0.0 or args.covariance_limit <= 0.0:
+        raise ValueError("variance and covariance limits must be positive")
+    if args.scalar_tolerance < 0.0:
+        raise ValueError("--scalar-tolerance must be non-negative")
+    if args.max_moment_discrepancy <= 0.0:
+        raise ValueError("--max-moment-discrepancy must be positive")
 
     run_ids = parse_int_spec(args.run_ids)
     scalar_configs = parse_str_list(args.scalar_configs)
@@ -1072,8 +1455,16 @@ def main():
     stride_values = parse_int_spec(args.strides)
     moment_bin_counts = parse_int_spec(args.moment_bins)
 
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("--run-ids must not contain duplicates")
+    if len(set(scalar_configs)) != len(scalar_configs):
+        raise ValueError("--scalar-configs must not contain duplicates")
+    if len(set(box_widths)) != len(box_widths):
+        raise ValueError("--box-widths must not contain duplicates")
     if len(moment_bin_counts) != 5:
         raise ValueError("--moment-bins must provide exactly 5 integers")
+    if any(count <= 0 for count in moment_bin_counts):
+        raise ValueError("--moment-bins values must be positive")
     if len(stride_values) == 1:
         stride_values = stride_values * len(box_widths)
     if len(stride_values) != len(box_widths):
@@ -1082,22 +1473,44 @@ def main():
         raise ValueError("All --box-widths values must be positive even integers")
     if any(stride <= 0 for stride in stride_values):
         raise ValueError("All stride values must be positive")
+    if not (0.0 <= args.shape_threshold <= 1.0):
+        raise ValueError("--shape-threshold must lie in [0, 1]")
+    if args.corner_threshold < 0.0 or args.edge_threshold < 0.0:
+        raise ValueError("corner and edge thresholds must be non-negative")
+    if args.center_radius < 0.0:
+        raise ValueError("--center-radius must be non-negative")
+    if max(box_widths) // 2 > args.nx:
+        raise ValueError("half of the largest box width cannot exceed --nx")
 
     layout = get_histogram_layout(args.pdf_bins, zst=args.zst, non_uniform=not args.uniform_bins)
     shape_masks = build_shape_masks(layout, args.corner_threshold, args.edge_threshold, args.center_radius)
     pad_width = max(width // 2 for width in box_widths)
 
     fdir = os.path.abspath(args.folder)
+    if not args.skip_phase1 and not os.path.isdir(fdir):
+        raise FileNotFoundError(f"input folder does not exist: {fdir}")
     output_dir = os.path.abspath(args.output_dir)
     rank_root_dir = os.path.join(output_dir, args.rank_output_subdir)
     rank_output_dir = os.path.join(rank_root_dir, f"rank_{rank:04d}")
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(rank_root_dir, exist_ok=True)
+        if not args.skip_phase1:
+            if os.path.isdir(rank_root_dir):
+                shutil.rmtree(rank_root_dir)
+            os.makedirs(rank_root_dir)
     comm.Barrier()
 
     per_rank_cap = max(1, args.max_per_moment_bin * args.per_rank_cap_multiplier)
+    phase1_config = phase1_configuration(
+        args,
+        fdir=fdir,
+        run_ids=run_ids,
+        scalar_configs=scalar_configs,
+        box_widths=box_widths,
+        stride_values=stride_values,
+    )
+    phase1_signature = configuration_signature(phase1_config)
 
     if args.skip_phase1:
         if rank != 0:
@@ -1116,7 +1529,7 @@ def main():
             print(
                 f"[mpi] size={size} total_work_units={len(all_units)} "
                 f"per_rank_units≈{len(all_units)/max(size,1):.2f} "
-                f"per_rank_cap={per_rank_cap} global_cap={args.max_per_moment_bin}",
+                f"phase1=lossless global_cap={args.max_per_moment_bin}",
                 flush=True,
             )
 
@@ -1154,6 +1567,8 @@ def main():
             rank_work_units=rank_units,
             start_time=start_time,
             per_rank_cap=per_rank_cap,
+            phase1_config=phase1_config,
+            phase1_signature=phase1_signature,
         )
         print(f"[rank {rank:03d}] phase 1 done: retained={rank_kept} elapsed={time.time()-start_time:.1f}s", flush=True)
 
@@ -1168,6 +1583,13 @@ def main():
 
     print(f"[rank 000] phase 2 (merge) start; reading per-rank outputs from {rank_root_dir}", flush=True)
     rank_dirs = sorted(glob.glob(os.path.join(rank_root_dir, "rank_*")))
+    source_mpi_size = validate_rank_outputs(
+        rank_dirs,
+        args.rank_dataset_tag,
+        phase1_signature,
+        expected_size=(None if args.skip_phase1 else size),
+        expected_work_units=enumerate_work_units(run_ids, scalar_configs),
+    )
     phase1_counters, phase1_missing, rank_summaries = aggregate_rank_manifests(rank_dirs, args.rank_dataset_tag)
 
     final_metadata, final_pdfs, merge_counters = merge_per_rank_outputs(
@@ -1188,9 +1610,14 @@ def main():
     combined_counters.update(merge_counters)
 
     extra = {
-        "mpi_size": int(size),
+        "mpi_size": int(source_mpi_size),
         "per_rank_cap": int(per_rank_cap),
         "per_rank_cap_multiplier": int(args.per_rank_cap_multiplier),
+        "phase1_configuration": phase1_config,
+        "phase1_signature": phase1_signature,
+        "lossless_phase1": True,
+        "merge_order": "sha256_seeded_physical_candidate_key",
+        "selection_seed": int(args.selection_seed),
         "rank_summaries": rank_summaries,
     }
 
@@ -1213,6 +1640,26 @@ def main():
         extra_manifest=extra,
     )
     metadata_path, shard_paths, manifest_path, final_count = result
+    try:
+        post_write_validation = validate_dataset(
+            metadata_path,
+            output_dir,
+            num_bins=args.pdf_bins,
+            zst=args.zst,
+            uniform_bins=args.uniform_bins,
+            max_moment_discrepancy=args.max_moment_discrepancy,
+        )
+    except Exception:
+        if os.path.exists(manifest_path):
+            os.remove(manifest_path)
+        raise
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        final_manifest_data = json.load(handle)
+    final_manifest_data["post_write_validation"] = post_write_validation
+    validation_manifest_path = manifest_path + ".tmp"
+    with open(validation_manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(final_manifest_data, handle, indent=2)
+    os.replace(validation_manifest_path, manifest_path)
 
     if not args.keep_rank_outputs:
         shutil.rmtree(rank_root_dir, ignore_errors=True)

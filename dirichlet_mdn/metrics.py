@@ -15,9 +15,7 @@ import pandas as pd
 import torch
 
 from .bin_grid import BinGrid
-from .losses import dirichlet_logpdf, mixture_logpdf, stack_predicted_moments
-
-LOG_EPS = 1e-12
+from .losses import mixture_logpdf, stack_predicted_moments
 
 
 # ---------------------------------------------------------------------------
@@ -37,16 +35,14 @@ def predict_histograms(
 
     Returns: ``(B, N, N)`` float32 tensor summing to 1 over the simplex.
     """
-    centers_a = torch.from_numpy(grid.centers_a).to(pi)
-    centers_b = torch.from_numpy(grid.centers_b).to(pi)
+    centroid_a = torch.from_numpy(grid.cell_centroid_a).to(pi)
+    centroid_b = torch.from_numpy(grid.cell_centroid_b).to(pi)
     cell_area = torch.from_numpy(grid.cell_area).to(pi)
     mask = torch.from_numpy(grid.simplex_mask).to(pi.device)
 
-    grid_a = centers_a.unsqueeze(1).expand(-1, grid.num_bins)
-    grid_b = centers_b.unsqueeze(0).expand(grid.num_bins, -1)
-    z1 = grid_a.reshape(-1)
-    z2 = grid_b.reshape(-1)
-    z3 = (1.0 - z1 - z2).clamp(min=0.0)
+    z1 = centroid_a.reshape(-1)
+    z2 = centroid_b.reshape(-1)
+    z3 = 1.0 - z1 - z2
     z = torch.stack([z1, z2, z3], dim=-1)                                   # (N*N, 3)
 
     flat_mask = mask.reshape(-1)
@@ -54,7 +50,7 @@ def predict_histograms(
     area_in = cell_area.reshape(-1)[flat_mask]                              # (M,)
 
     log_density = mixture_logpdf(z_in, pi, alpha)                           # (B, M)
-    log_unnorm = log_density + torch.log(area_in + LOG_EPS)
+    log_unnorm = log_density + torch.log(area_in)
     log_norm = torch.logsumexp(log_unnorm, dim=-1, keepdim=True)
     q_flat = torch.exp(log_unnorm - log_norm)                               # (B, M)
 
@@ -69,11 +65,21 @@ def predict_histograms(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_rows(values: np.ndarray) -> np.ndarray:
+    if not np.isfinite(values).all() or np.any(values < 0.0):
+        raise ValueError("histograms must contain finite, non-negative mass")
+    totals = values.sum(axis=-1, keepdims=True)
+    if np.any(totals <= 0.0):
+        raise ValueError("histograms must have positive total mass")
+    return values / totals
+
+
 def joint_l1(p: np.ndarray, q: np.ndarray, simplex_mask: np.ndarray) -> np.ndarray:
     """Per-record L1 over in-simplex cells. Returns shape (B,)."""
-    diff = np.abs(p - q)
-    mask = simplex_mask.astype(p.dtype)
-    return (diff * mask).reshape(diff.shape[0], -1).sum(axis=-1)
+    mask = simplex_mask.reshape(1, -1)
+    p_flat = _normalise_rows(p.reshape(p.shape[0], -1) * mask)
+    q_flat = _normalise_rows(q.reshape(q.shape[0], -1) * mask)
+    return np.abs(p_flat - q_flat).sum(axis=-1)
 
 
 def joint_jsd(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -81,11 +87,15 @@ def joint_jsd(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
     Bits (log base 2). Matches MLPDF.py:79 modulo broadcasting.
     """
-    p = p.reshape(p.shape[0], -1) + eps
-    q = q.reshape(q.shape[0], -1) + eps
+    p = _normalise_rows(p.reshape(p.shape[0], -1))
+    q = _normalise_rows(q.reshape(q.shape[0], -1))
     m = 0.5 * (p + q)
-    kl_pm = (p * (np.log2(p) - np.log2(m))).sum(axis=-1)
-    kl_qm = (q * (np.log2(q) - np.log2(m))).sum(axis=-1)
+    ratio_p = np.ones_like(p)
+    ratio_q = np.ones_like(q)
+    np.divide(p, m, out=ratio_p, where=p > 0.0)
+    np.divide(q, m, out=ratio_q, where=q > 0.0)
+    kl_pm = (p * np.log2(ratio_p)).sum(axis=-1)
+    kl_qm = (q * np.log2(ratio_q)).sum(axis=-1)
     return 0.5 * (kl_pm + kl_qm)
 
 
@@ -100,15 +110,22 @@ def marginal_jsd(
 
     ``axis`` ∈ {0, 1} refers to the Z1/Z2 axis to *keep*. Output shape (B,).
     """
+    if axis not in (0, 1):
+        raise ValueError(f"axis must be 0 or 1, got {axis}")
+    p = _normalise_rows(p.reshape(p.shape[0], -1)).reshape(p.shape)
+    q = _normalise_rows(q.reshape(q.shape[0], -1)).reshape(q.shape)
     sum_axis = 1 if axis == 0 else 0
     pm = p.sum(axis=sum_axis + 1)   # +1 because of leading batch dim
     qm = q.sum(axis=sum_axis + 1)
-    pm = pm[:, :, None] if False else pm  # already (B, N)
-    pm = pm + eps
-    qm = qm + eps
+    pm = _normalise_rows(pm)
+    qm = _normalise_rows(qm)
     m = 0.5 * (pm + qm)
-    kl_pm = (pm * (np.log2(pm) - np.log2(m))).sum(axis=-1)
-    kl_qm = (qm * (np.log2(qm) - np.log2(m))).sum(axis=-1)
+    ratio_p = np.ones_like(pm)
+    ratio_q = np.ones_like(qm)
+    np.divide(pm, m, out=ratio_p, where=pm > 0.0)
+    np.divide(qm, m, out=ratio_q, where=qm > 0.0)
+    kl_pm = (pm * np.log2(ratio_p)).sum(axis=-1)
+    kl_qm = (qm * np.log2(ratio_q)).sum(axis=-1)
     return 0.5 * (kl_pm + kl_qm)
 
 

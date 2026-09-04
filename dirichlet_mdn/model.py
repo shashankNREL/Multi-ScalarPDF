@@ -25,7 +25,7 @@ class DirichletMDN(nn.Module):
         n_in: int,
         K: int = 8,
         hidden: int = 256,
-        alpha_min: float = 1e-3,
+        alpha_min: float = 1.0,
         alpha_clip: float = 1e3,
     ) -> None:
         super().__init__()
@@ -33,6 +33,14 @@ class DirichletMDN(nn.Module):
             raise ValueError(f"n_in must be 4 or 5, got {n_in}")
         if K < 1:
             raise ValueError(f"K must be >= 1, got {K}")
+        if hidden < 1:
+            raise ValueError(f"hidden must be >= 1, got {hidden}")
+        if alpha_min < 1.0:
+            raise ValueError(
+                "alpha_min must be >= 1.0 because grid cell masses are evaluated "
+                "at cell centroids; concentrations below one have boundary "
+                "singularities that this approximation cannot represent reliably"
+            )
         if alpha_clip <= alpha_min:
             raise ValueError("alpha_clip must exceed alpha_min")
 
@@ -62,7 +70,7 @@ class DirichletMDN(nn.Module):
         h = self.trunk(m)
         pi = torch.softmax(self.head_pi(h), dim=-1)
         raw_alpha = nn.functional.softplus(self.head_alpha(h)) + self.alpha_min
-        alpha = raw_alpha.clamp(max=self.alpha_clip)
+        alpha = raw_alpha.clamp(min=self.alpha_min, max=self.alpha_clip)
         alpha = alpha.view(-1, self.K, 3)
         return pi, alpha
 

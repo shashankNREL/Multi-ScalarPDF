@@ -4,7 +4,7 @@ Three terms (DirichletMDN_proposal.md §3.4):
 
   1. ``histogram_nll`` — categorical NLL on the simplex grid.
      For each batch element, evaluate the mixture density at every in-simplex
-     bin center, multiply by the cell area, renormalize over the in-simplex
+     clipped-cell centroid, multiply by the cell area, renormalize over the
      cells, and take ``L = -Σ_ij hist_ij * log(q_ij)``. Evaluated in log space
      throughout (logsumexp over components).
 
@@ -89,14 +89,14 @@ class HistogramNLL(nn.Module):
         super().__init__()
         mask = torch.from_numpy(grid.simplex_mask)
         cell_area = torch.from_numpy(grid.cell_area)
-        grid_a = torch.from_numpy(grid.centers_a).unsqueeze(1).expand(-1, grid.num_bins)
-        grid_b = torch.from_numpy(grid.centers_b).unsqueeze(0).expand(grid.num_bins, -1)
+        grid_a = torch.from_numpy(grid.cell_centroid_a)
+        grid_b = torch.from_numpy(grid.cell_centroid_b)
 
         flat_mask = mask.reshape(-1)
         z1 = grid_a.reshape(-1)[flat_mask].to(torch.float64)
         z2 = grid_b.reshape(-1)[flat_mask].to(torch.float64)
         area = cell_area.reshape(-1)[flat_mask].to(torch.float64)
-        z3 = (1.0 - z1 - z2).clamp(min=0.0)
+        z3 = 1.0 - z1 - z2
 
         z_simplex = torch.stack([z1, z2, z3], dim=-1).to(torch.float32)
         self.register_buffer("z_simplex", z_simplex)                    # (M, 3)
@@ -107,8 +107,7 @@ class HistogramNLL(nn.Module):
 
         # ---- Static buffers used inside forward() ----
         # log(cell_area + eps): used to convert log-density to log-mass per cell.
-        self.register_buffer("log_cell_area",
-                             torch.log(area.to(torch.float32) + LOG_EPS))         # (M,)
+        self.register_buffer("log_cell_area", torch.log(area.to(torch.float32))) # (M,)
         # log(z_norm) where z_norm = clamp(z, eps) / sum_clamp.
         # This term depends only on the grid (z is fixed across all batches).
         z_c = z_simplex.clamp(min=dirichlet_eps)
@@ -121,13 +120,13 @@ class HistogramNLL(nn.Module):
         self.eps = eps
         self.dirichlet_eps = dirichlet_eps
 
-    def forward(
+    def per_record(
         self,
         pi: torch.Tensor,
         alpha: torch.Tensor,
         histogram: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the mean categorical NLL over the batch.
+        """Compute categorical NLL separately for every batch record.
 
         ``histogram`` may be either the full ``(B, N, N)`` 2-D grid (legacy)
         or the pre-flattened in-simplex ``(B, M)`` form (preferred — set by
@@ -151,10 +150,39 @@ class HistogramNLL(nn.Module):
         if histogram.dim() == 2 and histogram.shape[-1] == self.num_simplex_cells:
             p_flat = histogram                                         # already (B, M)
         else:
-            p_flat = histogram.reshape(histogram.shape[0], -1).index_select(
-                -1, self.flat_simplex_index)
-        nll_per_record = -(p_flat * log_q).sum(dim=-1)                 # (B,)
-        return nll_per_record.mean()
+            full_flat = histogram.reshape(histogram.shape[0], -1)
+            if full_flat.shape[-1] != self.num_bins ** 2:
+                raise ValueError(
+                    f"target histogram has {full_flat.shape[-1]} cells; "
+                    f"expected {self.num_bins ** 2}"
+                )
+            if not torch.isfinite(full_flat).all():
+                raise ValueError("target histogram contains NaN or infinite values")
+            if (full_flat < 0.0).any():
+                raise ValueError("target histogram contains negative probability mass")
+            p_flat = full_flat.index_select(-1, self.flat_simplex_index)
+            total_mass = full_flat.sum(dim=-1, keepdim=True)
+            inside_mass = p_flat.sum(dim=-1, keepdim=True)
+            if ((total_mass - inside_mass) > 1e-7 * total_mass.clamp_min(1.0)).any():
+                raise ValueError("target histogram contains mass outside the simplex")
+        if not torch.isfinite(p_flat).all():
+            raise ValueError("target histogram contains NaN or infinite values")
+        if (p_flat < 0.0).any():
+            raise ValueError("target histogram contains negative probability mass")
+        target_mass = p_flat.sum(dim=-1, keepdim=True)
+        if (target_mass <= self.eps).any():
+            raise ValueError("target histogram has no mass inside the physical simplex")
+        p_flat = p_flat / target_mass
+        return -(p_flat * log_q).sum(dim=-1)                          # (B,)
+
+    def forward(
+        self,
+        pi: torch.Tensor,
+        alpha: torch.Tensor,
+        histogram: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute mean categorical NLL over the batch."""
+        return self.per_record(pi, alpha, histogram).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +236,22 @@ def moment_loss(
     alpha: torch.Tensor,
     m_input: torch.Tensor,
     input_moments: int,
+    scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MSE between predicted and target moments."""
+    """Dimensionless MSE between predicted and target moments.
+
+    Means naturally span ``[0, 1]``. Variances of a bounded scalar and the
+    covariance span at most ``0.25`` in magnitude, so those physical ranges
+    are used as default scales. This prevents raw mean errors from dominating
+    the smaller-valued second moments.
+    """
     pred = stack_predicted_moments(pi, alpha, input_moments)
-    return ((pred - m_input) ** 2).mean()
+    if scales is None:
+        default = [1.0, 0.25, 1.0, 0.25]
+        if input_moments == 5:
+            default.append(0.25)
+        scales = pred.new_tensor(default)
+    return (((pred - m_input) / scales) ** 2).mean()
 
 
 # ---------------------------------------------------------------------------

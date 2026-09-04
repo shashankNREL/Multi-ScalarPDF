@@ -1,16 +1,15 @@
 """Train/val/test splits for the Dirichlet MDN.
 
-Splits by ``(scalar_config, run_id)`` rather than by row. This is critical:
-boxes from the same physical DNS run are highly correlated, so row-wise
-splitting (as in ``MLPDF.py:177``) leaks information from train into val.
+Splits by global ``run_id`` rather than by row or independently by scalar
+configuration. Boxes and scalar configurations from the same physical DNS run
+share a velocity realization, so that run must stay in one partition.
 
 Two modes:
 
-  - default          : per-config train/val/test split on run_ids
+  - default          : one global train/val/test split on run_ids
                        (default ratios 0.7 / 0.15 / 0.15).
-  - holdout-config   : one named ``scalar_config`` is entirely held out as the
-                       test set; the remaining configs are split into train and
-                       val by run_id.
+  - holdout-config   : one named ``scalar_config`` is the entire test set; the
+                       remaining configs are split into train and val only.
 """
 
 from __future__ import annotations
@@ -22,6 +21,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+from .data import metadata_fingerprint
 
 
 @dataclass
@@ -39,42 +40,44 @@ def _split_runs(
 ) -> Tuple[List[int], List[int], List[int]]:
     runs = sorted(set(int(r) for r in run_ids))
     n = len(runs)
-    if n < 3:
-        return runs, [], []
     perm = list(rng.permutation(n))
     shuffled = [runs[i] for i in perm]
-    n_train = max(1, int(round(ratios[0] * n)))
-    n_val = max(1, int(round(ratios[1] * n)))
-    if n_train + n_val >= n:
-        n_val = max(1, n - n_train - 1)
-        n_train = n - n_val - 1
+    counts = _allocate_counts(n, ratios)
+    n_train, n_val, _ = counts
     train = shuffled[:n_train]
     val = shuffled[n_train:n_train + n_val]
     test = shuffled[n_train + n_val:]
     return train, val, test
 
 
-def _split_timesteps(
-    timesteps: Sequence[int],
+def _allocate_counts(
+    n: int,
     ratios: Tuple[float, float, float],
-) -> Tuple[List[int], List[int], List[int]]:
-    """Contiguous early/mid/late split. Used as fallback when a config has only
-    one run_id. No shuffle — keeps val/test from being interleaved time slices
-    of the same Lagrangian evolution as train.
-    """
-    ts = sorted(set(int(t) for t in timesteps))
-    n = len(ts)
-    if n < 3:
-        return ts, [], []
-    n_train = max(1, int(round(ratios[0] * n)))
-    n_val = max(1, int(round(ratios[1] * n)))
-    if n_train + n_val >= n:
-        n_val = max(1, n - n_train - 1)
-        n_train = n - n_val - 1
-    train = ts[:n_train]
-    val = ts[n_train:n_train + n_val]
-    test = ts[n_train + n_val:]
-    return train, val, test
+) -> Tuple[int, int, int]:
+    """Allocate exactly ``n`` items while respecting zero-valued ratios."""
+    values = np.asarray(ratios, dtype=np.float64)
+    if np.any(values < 0.0) or not np.isclose(values.sum(), 1.0, atol=1e-9):
+        raise ValueError(f"split ratios must be non-negative and sum to one: {ratios}")
+    raw = values * n
+    counts = np.floor(raw).astype(int)
+    remainder = n - int(counts.sum())
+    order = np.argsort(-(raw - counts), kind="stable")
+    for index in order[:remainder]:
+        counts[index] += 1
+
+    positive = np.flatnonzero(values > 0.0)
+    if n >= len(positive):
+        for index in positive:
+            if counts[index] == 0:
+                donors = [
+                    donor for donor in positive
+                    if counts[donor] > 1
+                ]
+                if donors:
+                    donor = max(donors, key=lambda item: counts[item])
+                    counts[donor] -= 1
+                    counts[index] += 1
+    return tuple(int(value) for value in counts)
 
 
 def make_split(
@@ -85,33 +88,33 @@ def make_split(
     holdout_config: Optional[str] = None,
     fallback: str = "timestep",
 ) -> SplitResult:
-    """Build a leak-free split.
+    """Build a run-isolated split.
 
     Args:
         meta: parquet metadata as returned by ``data.load_metadata``.
         seed: deterministic seed for the by-run_id permutation.
-        ratios: (train, val, test) fractions, used per-config.
+        ratios: (train, val, test) fractions, applied to global run IDs.
         holdout_config: if set, this scalar_config goes entirely to ``test``;
             the rest are split with ``(0.8, 0.2, 0.0)``.
-        fallback: behavior when a config has fewer than 3 distinct run_ids.
-            * ``"timestep"`` — split by contiguous timestep blocks within that
-              config. Acknowledged less-clean than by-run; flagged in the
-              description.
-            * ``"train_only"`` — put all rows of that config into train and
-              log a warning. Reproduces the strict "no leak possible" guarantee
-              at the cost of an empty val/test for that config.
+        fallback: deprecated compatibility argument. Timestep fallback is never
+            used because it would leak a physical run across partitions.
 
-    The returned ``description`` records, per config, the mode actually used
-    and the resolved run/timestep partition.
+    The returned ``description`` records the grouping policy and resolved runs.
     """
     if fallback not in ("timestep", "train_only"):
         raise ValueError(f"fallback must be 'timestep' or 'train_only', got {fallback!r}")
+    _allocate_counts(0, ratios)
     rng = np.random.default_rng(seed)
     description: dict = {
         "seed": seed,
         "ratios": list(ratios),
         "holdout_config": holdout_config,
-        "fallback": fallback,
+        "deprecated_fallback_argument": fallback,
+        "grouping": (
+            "configuration_holdout_plus_global_train_val_run_id"
+            if holdout_config is not None else "global_run_id"
+        ),
+        "dataset_fingerprint": metadata_fingerprint(meta),
         "per_config": {},
         "totals": {},
     }
@@ -123,81 +126,59 @@ def make_split(
                 f"(have {sorted(meta['scalar_config'].unique())})"
             )
 
-    train_idx: List[int] = []
-    val_idx: List[int] = []
-    test_idx: List[int] = []
+    eligible = (
+        meta[meta["scalar_config"] != holdout_config]
+        if holdout_config is not None else meta
+    )
+    unique_runs = sorted(int(value) for value in eligible["run_id"].unique())
+    active_ratios = (0.8, 0.2, 0.0) if holdout_config is not None else ratios
 
+    runs_train, runs_val, runs_test = _split_runs(
+        unique_runs, active_ratios, rng,
+    )
+    train_mask = eligible["run_id"].isin(runs_train)
+    val_mask = eligible["run_id"].isin(runs_val)
+    test_mask = eligible["run_id"].isin(runs_test)
+    split_mode = "global_run_id"
+
+    train_idx = eligible.index[train_mask].tolist()
+    val_idx = eligible.index[val_mask].tolist()
+    test_idx = eligible.index[test_mask].tolist()
+    if holdout_config is not None:
+        test_idx.extend(meta.index[meta["scalar_config"] == holdout_config].tolist())
+
+    description["global_partition"] = {
+        "mode": split_mode,
+        "ratios": list(active_ratios),
+        "train_runs": runs_train,
+        "val_runs": runs_val,
+        "test_runs": runs_test,
+    }
+    train_set, val_set, test_set = set(train_idx), set(val_idx), set(test_idx)
     for cfg, cfg_meta in meta.groupby("scalar_config", sort=True):
-        idx_in_cfg = cfg_meta.index.to_numpy()
-        if holdout_config is not None and cfg == holdout_config:
-            test_idx.extend(idx_in_cfg.tolist())
-            description["per_config"][cfg] = {
-                "mode": "held_out_as_test",
-                "n_runs": int(cfg_meta["run_id"].nunique()),
-                "n_rows": int(len(cfg_meta)),
-                "train_runs": [], "val_runs": [],
-                "test_runs": sorted(set(int(r) for r in cfg_meta["run_id"].unique())),
-            }
-            continue
-
-        if holdout_config is not None:
-            cfg_ratios = (0.8, 0.2, 0.0)
-        else:
-            cfg_ratios = ratios
-
-        n_runs = cfg_meta["run_id"].nunique()
-        if n_runs >= 3:
-            runs_train, runs_val, runs_test = _split_runs(
-                cfg_meta["run_id"].unique().tolist(), cfg_ratios, rng,
-            )
-            train_mask = cfg_meta["run_id"].isin(runs_train)
-            val_mask = cfg_meta["run_id"].isin(runs_val)
-            test_mask = cfg_meta["run_id"].isin(runs_test)
-            mode = "by_run_id" if holdout_config is None else "by_run_id_with_holdout"
-            partition_log = {
-                "train_runs": runs_train,
-                "val_runs": runs_val,
-                "test_runs": runs_test,
-            }
-        elif fallback == "timestep":
-            t_train, t_val, t_test = _split_timesteps(
-                cfg_meta["timestep"].unique().tolist(), cfg_ratios,
-            )
-            train_mask = cfg_meta["timestep"].isin(t_train)
-            val_mask = cfg_meta["timestep"].isin(t_val)
-            test_mask = cfg_meta["timestep"].isin(t_test)
-            mode = f"by_timestep_fallback(n_runs={n_runs})"
-            partition_log = {
-                "train_timesteps": t_train,
-                "val_timesteps": t_val,
-                "test_timesteps": t_test,
-            }
-        else:  # train_only
-            train_mask = pd.Series(True, index=cfg_meta.index)
-            val_mask = pd.Series(False, index=cfg_meta.index)
-            test_mask = pd.Series(False, index=cfg_meta.index)
-            mode = f"train_only_fallback(n_runs={n_runs})"
-            partition_log = {
-                "train_runs": sorted(set(int(r) for r in cfg_meta["run_id"].unique())),
-                "val_runs": [],
-                "test_runs": [],
-            }
-
-        train_idx.extend(cfg_meta.index[train_mask].tolist())
-        val_idx.extend(cfg_meta.index[val_mask].tolist())
-        test_idx.extend(cfg_meta.index[test_mask].tolist())
-
+        cfg_indices = set(int(index) for index in cfg_meta.index)
+        mode = "held_out_as_test" if cfg == holdout_config else split_mode
         description["per_config"][cfg] = {
             "mode": mode,
-            "n_runs": int(n_runs),
+            "n_runs": int(cfg_meta["run_id"].nunique()),
             "n_rows": int(len(cfg_meta)),
-            "ratios_used": list(cfg_ratios),
-            **partition_log,
+            "train_runs": sorted(
+                int(value) for value in
+                cfg_meta.loc[list(cfg_indices & train_set), "run_id"].unique()
+            ),
+            "val_runs": sorted(
+                int(value) for value in
+                cfg_meta.loc[list(cfg_indices & val_set), "run_id"].unique()
+            ),
+            "test_runs": sorted(
+                int(value) for value in
+                cfg_meta.loc[list(cfg_indices & test_set), "run_id"].unique()
+            ),
         }
 
-    train_arr = np.asarray(sorted(set(train_idx)), dtype=np.int64)
-    val_arr = np.asarray(sorted(set(val_idx)), dtype=np.int64)
-    test_arr = np.asarray(sorted(set(test_idx)), dtype=np.int64)
+    train_arr = np.asarray(sorted(train_idx), dtype=np.int64)
+    val_arr = np.asarray(sorted(val_idx), dtype=np.int64)
+    test_arr = np.asarray(sorted(test_idx), dtype=np.int64)
 
     description["totals"] = {
         "train": int(len(train_arr)),
@@ -205,7 +186,77 @@ def make_split(
         "test": int(len(test_arr)),
         "all": int(len(meta)),
     }
-    return SplitResult(train=train_arr, val=val_arr, test=test_arr, description=description)
+    result = SplitResult(
+        train=train_arr, val=val_arr, test=test_arr, description=description,
+    )
+    validate_split(result, meta)
+    return result
+
+
+def validate_split(result: SplitResult, meta: pd.DataFrame) -> None:
+    """Validate identity, disjointness, uniqueness, and full row coverage."""
+    expected_fingerprint = metadata_fingerprint(meta)
+    actual_fingerprint = result.description.get("dataset_fingerprint")
+    if actual_fingerprint != expected_fingerprint:
+        raise ValueError(
+            "split dataset fingerprint does not match the loaded metadata; "
+            "regenerate the split from this Parquet file"
+        )
+
+    arrays = {
+        "train": result.train,
+        "val": result.val,
+        "test": result.test,
+    }
+    sets = {}
+    for name, values in arrays.items():
+        if len(values) != len(np.unique(values)):
+            raise ValueError(f"{name} split contains duplicate indices")
+        if len(values) and (values.min() < 0 or values.max() >= len(meta)):
+            raise ValueError(f"{name} split contains out-of-range indices")
+        sets[name] = set(int(value) for value in values)
+
+    overlap = (
+        (sets["train"] & sets["val"])
+        | (sets["train"] & sets["test"])
+        | (sets["val"] & sets["test"])
+    )
+    if overlap:
+        raise ValueError(f"split partitions overlap at {len(overlap)} row(s)")
+    covered = sets["train"] | sets["val"] | sets["test"]
+    expected = set(range(len(meta)))
+    if covered != expected:
+        raise ValueError(
+            f"split covers {len(covered)} of {len(expected)} metadata rows"
+        )
+
+    holdout_config = result.description.get("holdout_config")
+    if holdout_config is not None:
+        test_configs = set(meta.iloc[result.test]["scalar_config"])
+        if test_configs != {holdout_config}:
+            raise ValueError(
+                "holdout test set is contaminated by non-held configurations: "
+                f"{sorted(test_configs - {holdout_config})}"
+            )
+        train_runs = set(meta.iloc[result.train]["run_id"])
+        val_runs = set(meta.iloc[result.val]["run_id"])
+        if train_runs & val_runs:
+            raise ValueError("a physical run appears in both train and validation")
+    else:
+        run_sets = {
+            name: set(meta.iloc[values]["run_id"])
+            for name, values in arrays.items()
+        }
+        run_overlap = (
+            (run_sets["train"] & run_sets["val"])
+            | (run_sets["train"] & run_sets["test"])
+            | (run_sets["val"] & run_sets["test"])
+        )
+        if run_overlap:
+            raise ValueError(
+                "physical run IDs cross split boundaries: "
+                f"{sorted(run_overlap)}"
+            )
 
 
 def save_split(result: SplitResult, path: str) -> None:
@@ -220,15 +271,20 @@ def save_split(result: SplitResult, path: str) -> None:
         json.dump(payload, f, indent=2)
 
 
-def load_split(path: str) -> SplitResult:
+def load_split(path: str, meta: Optional[pd.DataFrame] = None) -> SplitResult:
     with open(path, "r") as f:
         d = json.load(f)
-    return SplitResult(
+    result = SplitResult(
         train=np.asarray(d["train"], dtype=np.int64),
         val=np.asarray(d["val"], dtype=np.int64),
         test=np.asarray(d["test"], dtype=np.int64),
         description=d["description"],
     )
+    if meta is not None:
+        validate_split(result, meta)
+    return result
 
 
-__all__ = ["SplitResult", "make_split", "save_split", "load_split"]
+__all__ = [
+    "SplitResult", "make_split", "save_split", "load_split", "validate_split",
+]

@@ -5,8 +5,8 @@
 This project learns a mapping from LES-filtered subgrid *moments* to the full joint
 subgrid PDF $P(Z_1, Z_2)$ of two mixture fractions in three-stream mixing. It replaces
 the pixel-wise softmax DNN of Yellapantula et al. (2019) with a parametric mixture model
-that lives natively on the 2-simplex, subsuming the analytical bivariate-beta hierarchy of
-Perry & Mueller (2018).
+that lives natively on the 2-simplex and is evaluated against the analytical
+bivariate-beta hierarchy of Perry & Mueller (2018).
 
 Two halves:
 
@@ -15,8 +15,8 @@ Two halves:
    moment-stratified library of filter-cell PDFs stored as HDF5 + a Parquet metadata index.
 2. **Dirichlet MDN** — the `dirichlet_mdn/` package: a mixture density network whose
    output is a mixture of $K$ Dirichlet components on the 2-simplex, so predicted PDFs are
-   valid (non-negative, normalized, correctly supported) and moment-consistent *by
-   construction*.
+   valid (non-negative, normalized, correctly supported). Moment agreement is encouraged
+   during training and measured during evaluation; it is not exact by construction.
 
 ## Scientific context
 
@@ -96,8 +96,9 @@ pixi run sample-mpi-smoke
 pixi run sample-mpi 8
 
 # 2. Inspect the dataset
-pixi run verify        # five self-checks: bin grid, gradients, moment algebra,
+pixi run verify        # five self-checks: bin grid, gradients, Monte Carlo moments,
                        # permutation invariance, K=1 recovery
+pixi run test          # deterministic remediation regression tests
 pixi run diversity     # coverage audit: cell counts, moment percentiles, plots
 pixi run preview-split # build + report a train/val/test split (no training)
 
@@ -119,6 +120,7 @@ pixi run tensorboard
 | `merge-only` | re-run Phase 2 merge over an existing `_rank/` tree |
 | `sample-serial` | single-process reference sampler |
 | `verify` | five dataset correctness self-checks |
+| `test` | deterministic geometry/sampling/split/loss/provenance tests |
 | `diversity` | dataset coverage audit + plots |
 | `preview-split <seed>` | build/report a split without training |
 | `train <k> <moments> <epochs> <tag>` | train the Dirichlet MDN |
