@@ -248,4 +248,76 @@ def validate_against_hdf5(
     return ok, diffs
 
 
-__all__ = ["BinGrid", "bin_grid", "validate_against_hdf5"]
+def load_bin_grid_from_hdf5(
+    h5_path: str,
+    *,
+    zst: float = 0.1,
+    uniform: bool = False,
+) -> BinGrid:
+    """Load the exact stored grid for explicit legacy-run evaluation."""
+    with h5py.File(h5_path, "r") as handle:
+        required = (
+            "bins/centers_a", "bins/centers_b", "bins/edges_a",
+            "bins/edges_b", "bins/cell_area", "bins/simplex_mask",
+        )
+        missing = [name for name in required if name not in handle]
+        if missing:
+            raise KeyError(f"{h5_path} lacks stored grid arrays: {missing}")
+        centers_a = np.asarray(handle["bins/centers_a"][:], dtype=np.float64)
+        centers_b = np.asarray(handle["bins/centers_b"][:], dtype=np.float64)
+        edges_a = np.asarray(handle["bins/edges_a"][:], dtype=np.float64)
+        edges_b = np.asarray(handle["bins/edges_b"][:], dtype=np.float64)
+        cell_area = np.asarray(handle["bins/cell_area"][:], dtype=np.float64)
+        simplex_mask = np.asarray(handle["bins/simplex_mask"][:], dtype=bool)
+        if (
+            "bins/cell_centroid_a" in handle
+            and "bins/cell_centroid_b" in handle
+        ):
+            centroid_a = np.asarray(
+                handle["bins/cell_centroid_a"][:], dtype=np.float64,
+            )
+            centroid_b = np.asarray(
+                handle["bins/cell_centroid_b"][:], dtype=np.float64,
+            )
+        else:
+            centroid_a, centroid_b = np.meshgrid(
+                centers_a, centers_b, indexing="ij",
+            )
+
+    num_bins = len(centers_a)
+    expected_shape = (num_bins, num_bins)
+    arrays = (cell_area, simplex_mask, centroid_a, centroid_b)
+    if (
+        centers_a.ndim != 1
+        or centers_b.shape != centers_a.shape
+        or edges_a.shape != (num_bins + 1,)
+        or edges_b.shape != (num_bins + 1,)
+        or any(array.shape != expected_shape for array in arrays)
+    ):
+        raise ValueError(f"{h5_path} contains inconsistent stored grid shapes")
+    numeric_arrays = (
+        centers_a, centers_b, edges_a, edges_b, cell_area, centroid_a, centroid_b,
+    )
+    if not all(np.isfinite(array).all() for array in numeric_arrays):
+        raise ValueError(f"{h5_path} contains non-finite stored grid values")
+    if np.any(cell_area < 0.0) or not np.any(simplex_mask):
+        raise ValueError(f"{h5_path} contains invalid stored grid support")
+    return BinGrid(
+        num_bins=num_bins,
+        zst=float(zst),
+        uniform=bool(uniform),
+        centers_a=centers_a,
+        centers_b=centers_b,
+        edges_a=edges_a,
+        edges_b=edges_b,
+        cell_area=cell_area,
+        cell_centroid_a=centroid_a,
+        cell_centroid_b=centroid_b,
+        simplex_mask=simplex_mask,
+    )
+
+
+__all__ = [
+    "BinGrid", "bin_grid", "load_bin_grid_from_hdf5",
+    "validate_against_hdf5",
+]

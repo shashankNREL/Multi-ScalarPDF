@@ -27,6 +27,7 @@ class DirichletMDN(nn.Module):
         hidden: int = 256,
         alpha_min: float = 1.0,
         alpha_clip: float = 1e3,
+        allow_alpha_below_one: bool = False,
     ) -> None:
         super().__init__()
         if n_in not in (4, 5):
@@ -35,7 +36,9 @@ class DirichletMDN(nn.Module):
             raise ValueError(f"K must be >= 1, got {K}")
         if hidden < 1:
             raise ValueError(f"hidden must be >= 1, got {hidden}")
-        if alpha_min < 1.0:
+        if alpha_min <= 0.0:
+            raise ValueError("alpha_min must be positive")
+        if alpha_min < 1.0 and not allow_alpha_below_one:
             raise ValueError(
                 "alpha_min must be >= 1.0 because grid cell masses are evaluated "
                 "at cell centroids; concentrations below one have boundary "

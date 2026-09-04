@@ -24,16 +24,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from .bin_grid import BinGrid, bin_grid
+from .bin_grid import BinGrid, bin_grid, load_bin_grid_from_hdf5
 from .data import HybridPDFDataset, collate_records, load_metadata
 from .losses import HistogramNLL, mixture_moments, stack_predicted_moments
 from .metrics import (
@@ -59,25 +61,60 @@ class EvalContext:
     scaler: TorchScaler
     nll_module: HistogramNLL
     input_moments: int
+    legacy_artifacts: bool
 
 
-def _load_context(run_dir: Path, device_override: Optional[str] = None) -> EvalContext:
+def _load_context(
+    run_dir: Path,
+    device_override: Optional[str] = None,
+    *,
+    allow_legacy_artifacts: bool = False,
+) -> EvalContext:
     with open(run_dir / "manifest.json", "r") as f:
         manifest = json.load(f)
     cfg = manifest["config"]
+    artifact_schema_version = int(manifest.get("artifact_schema_version", 1))
+    legacy_artifacts = artifact_schema_version < 2
+    if legacy_artifacts and not allow_legacy_artifacts:
+        raise ValueError(
+            "this run predates artifact schema version 2; rerun with "
+            "--allow-legacy-artifacts to evaluate it with its stored legacy "
+            "grid and pickle scaler"
+        )
+    if artifact_schema_version > 2:
+        raise ValueError(
+            f"unsupported run artifact schema version {artifact_schema_version}"
+        )
     device = resolve_device(device_override or cfg.get("device", "cpu"))
 
-    grid = bin_grid(
-        num_bins=int(cfg.get("num_bins", 64)),
-        zst=float(cfg.get("zst", 0.1)),
-        uniform=bool(cfg.get("uniform_bins", False)),
-    )
+    if legacy_artifacts:
+        meta = load_metadata(cfg["parquet"])
+        if meta.empty:
+            raise ValueError("cannot evaluate a legacy run against an empty dataset")
+        first_shard = Path(cfg["hdf5_dir"]) / str(meta["hdf5_file"].iloc[0])
+        grid = load_bin_grid_from_hdf5(
+            str(first_shard),
+            zst=float(cfg.get("zst", 0.1)),
+            uniform=bool(cfg.get("uniform_bins", False)),
+        )
+        warnings.warn(
+            "evaluating legacy artifacts with their stored grid; results are "
+            "not directly comparable with format-version-2 clipped-grid runs",
+            RuntimeWarning,
+        )
+    else:
+        grid = bin_grid(
+            num_bins=int(cfg.get("num_bins", 64)),
+            zst=float(cfg.get("zst", 0.1)),
+            uniform=bool(cfg.get("uniform_bins", False)),
+        )
     model = DirichletMDN(
         n_in=int(cfg["input_moments"]),
         K=int(cfg["K"]),
         hidden=int(cfg["hidden"]),
         alpha_min=float(cfg["alpha_min"]),
         alpha_clip=float(cfg["alpha_clip"]),
+        allow_alpha_below_one=legacy_artifacts,
     ).to(device)
 
     ckpt_path = run_dir / "model_best.pt"
@@ -87,8 +124,21 @@ def _load_context(run_dir: Path, device_override: Optional[str] = None) -> EvalC
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    with open(run_dir / "input_transform.json", "r") as f:
-        scaler = TorchScaler.from_artifact(json.load(f)).to(device)
+    transform_path = run_dir / "input_transform.json"
+    if transform_path.exists():
+        with open(transform_path, "r") as f:
+            scaler = TorchScaler.from_artifact(json.load(f)).to(device)
+    elif legacy_artifacts:
+        scaler_path = run_dir / "scaler.pkl"
+        if not scaler_path.exists():
+            raise FileNotFoundError(
+                "legacy run lacks both input_transform.json and scaler.pkl"
+            )
+        scaler = TorchScaler(joblib.load(scaler_path)).to(device)
+    else:
+        raise FileNotFoundError(
+            "artifact-schema-version-2 run lacks input_transform.json"
+        )
 
     nll_module = HistogramNLL(grid).to(device)
 
@@ -101,6 +151,7 @@ def _load_context(run_dir: Path, device_override: Optional[str] = None) -> EvalC
         scaler=scaler,
         nll_module=nll_module,
         input_moments=int(cfg["input_moments"]),
+        legacy_artifacts=legacy_artifacts,
     )
 
 
@@ -211,9 +262,18 @@ def _select_album_examples(meta_df: pd.DataFrame, *, per_cfg: int = 3) -> List[i
     return rows
 
 
-def evaluate_run(run_dir: Path, *, device_override: Optional[str] = None,
-                 album_per_cfg: int = 3) -> dict:
-    ctx = _load_context(run_dir, device_override=device_override)
+def evaluate_run(
+    run_dir: Path,
+    *,
+    device_override: Optional[str] = None,
+    album_per_cfg: int = 3,
+    allow_legacy_artifacts: bool = False,
+) -> dict:
+    ctx = _load_context(
+        run_dir,
+        device_override=device_override,
+        allow_legacy_artifacts=allow_legacy_artifacts,
+    )
     cfg = ctx.config
     eval_dir = run_dir / "eval"
     plot_dir = eval_dir / "plots"
@@ -221,7 +281,12 @@ def evaluate_run(run_dir: Path, *, device_override: Optional[str] = None,
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     meta = load_metadata(cfg["parquet"])
-    split = load_split(str(run_dir / "splits.json"), meta=meta)
+    split = load_split(
+        str(run_dir / "splits.json"),
+        meta=meta,
+        allow_legacy_fingerprint=ctx.legacy_artifacts,
+        enforce_run_isolation=not ctx.legacy_artifacts,
+    )
     if len(split.test) == 0:
         print(f"[evaluate] WARNING: test split is empty. Run dir: {run_dir}", file=sys.stderr)
         return {"n_test": 0}
@@ -234,6 +299,7 @@ def evaluate_run(run_dir: Path, *, device_override: Optional[str] = None,
         zst=float(cfg.get("zst", 0.1)),
         uniform_bins=bool(cfg.get("uniform_bins", False)),
         max_moment_discrepancy=float(cfg.get("max_moment_discrepancy", 0.05)),
+        grid_override=(ctx.grid if ctx.legacy_artifacts else None),
     )
     try:
         loader = DataLoader(
@@ -370,10 +436,19 @@ def cli(argv: Optional[list] = None) -> int:
     p.add_argument("--run-dir", required=True)
     p.add_argument("--device", default=None)
     p.add_argument("--album-per-cfg", type=int, default=3)
+    p.add_argument(
+        "--allow-legacy-artifacts",
+        action="store_true",
+        help=(
+            "Explicitly evaluate pre-v2 runs with their stored grid and "
+            "pickle-based scaler; results are not comparable with v2 runs"
+        ),
+    )
     args = p.parse_args(argv)
     evaluate_run(Path(args.run_dir),
                  device_override=args.device,
-                 album_per_cfg=int(args.album_per_cfg))
+                 album_per_cfg=int(args.album_per_cfg),
+                 allow_legacy_artifacts=bool(args.allow_legacy_artifacts))
     return 0
 
 

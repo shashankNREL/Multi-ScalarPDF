@@ -222,6 +222,7 @@ def _dataset_summary(meta) -> dict:
 
 def write_manifest(cfg: TrainConfig, run_dir: Path, extras: dict) -> None:
     manifest = {
+        "artifact_schema_version": 2,
         "config": asdict(cfg),
         "extras": extras,
         "created_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),

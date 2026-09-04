@@ -31,14 +31,17 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import timedelta
 
 import h5py
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from dirichlet_mdn.bin_grid import bin_grid
 from dirichlet_mdn.data import validate_dataset
@@ -560,6 +563,117 @@ def write_hdf5_shards(output_dir, dataset_tag, histograms, metadata_df, layout, 
     return shard_paths
 
 
+class StreamingRankWriter:
+    """Write lossless Phase-1 candidates one bounded-size shard at a time."""
+
+    def __init__(
+        self, output_dir, dataset_tag, layout, shard_size, compression,
+    ):
+        if shard_size <= 0:
+            raise ValueError("shard_size must be positive")
+        self.output_dir = output_dir
+        self.dataset_tag = dataset_tag
+        self.layout = layout
+        self.shard_size = int(shard_size)
+        self.compression = compression
+        self.metadata_path = os.path.join(
+            output_dir, f"{dataset_tag}_metadata.parquet",
+        )
+        self._metadata = []
+        self._pdfs = []
+        self._parquet_writer = None
+        self._next_sample_id = 0
+        self._next_shard_id = 0
+        self._closed = False
+        os.makedirs(output_dir, exist_ok=True)
+        remove_existing_shards(output_dir, dataset_tag)
+        if os.path.exists(self.metadata_path):
+            os.remove(self.metadata_path)
+
+    def add(self, metadata, pdf):
+        if self._closed:
+            raise RuntimeError("cannot add to a closed Phase-1 writer")
+        self._metadata.append(dict(metadata))
+        self._pdfs.append(np.asarray(pdf, dtype=np.float32))
+        if len(self._metadata) >= self.shard_size:
+            self._flush()
+
+    def _flush(self):
+        if not self._metadata:
+            return
+        shard_id = self._next_shard_id
+        shard_name = f"{self.dataset_tag}_{shard_id:04d}.h5"
+        shard_path = os.path.join(self.output_dir, shard_name)
+        histograms = np.stack(self._pdfs).astype(np.float32, copy=False)
+        count = len(self._metadata)
+        sample_ids = np.arange(
+            self._next_sample_id, self._next_sample_id + count, dtype=np.int64,
+        )
+        local_indices = np.arange(count, dtype=np.int32)
+
+        with h5py.File(shard_path, "w") as handle:
+            handle.attrs["dataset_tag"] = self.dataset_tag
+            handle.attrs["format_version"] = DATASET_FORMAT_VERSION
+            handle.attrs["num_samples"] = count
+            handle.attrs["num_bins_a"] = histograms.shape[1]
+            handle.attrs["num_bins_b"] = histograms.shape[2]
+            bins_group = handle.create_group("bins")
+            bins_group.create_dataset("edges_a", data=self.layout["edges_a"])
+            bins_group.create_dataset("edges_b", data=self.layout["edges_b"])
+            bins_group.create_dataset("centers_a", data=self.layout["centers_a"])
+            bins_group.create_dataset("centers_b", data=self.layout["centers_b"])
+            bins_group.create_dataset("cell_centroid_a", data=self.layout["grid_a"])
+            bins_group.create_dataset("cell_centroid_b", data=self.layout["grid_b"])
+            bins_group.create_dataset(
+                "simplex_mask",
+                data=self.layout["simplex_mask"].astype(np.uint8),
+            )
+            bins_group.create_dataset("cell_area", data=self.layout["cell_area"])
+            data_group = handle.create_group("data")
+            data_group.create_dataset(
+                "histograms",
+                data=histograms,
+                compression=self.compression,
+                shuffle=True,
+                chunks=(min(256, count), histograms.shape[1], histograms.shape[2]),
+            )
+            data_group.create_dataset("sample_id", data=sample_ids)
+            data_group.create_dataset("local_index", data=local_indices)
+
+        metadata_df = pd.DataFrame(self._metadata)
+        metadata_df.insert(0, "sample_id", sample_ids)
+        metadata_df.insert(1, "shard_id", np.full(count, shard_id, dtype=np.int32))
+        metadata_df.insert(2, "local_index", local_indices)
+        metadata_df.insert(3, "hdf5_file", np.full(count, shard_name, dtype=object))
+        table = pa.Table.from_pandas(metadata_df, preserve_index=False)
+        if self._parquet_writer is None:
+            self._parquet_writer = pq.ParquetWriter(self.metadata_path, table.schema)
+        else:
+            table = table.cast(self._parquet_writer.schema)
+        self._parquet_writer.write_table(table)
+
+        self._next_sample_id += count
+        self._next_shard_id += 1
+        self._metadata.clear()
+        self._pdfs.clear()
+
+    def close(self):
+        if not self._closed:
+            self._flush()
+            if self._parquet_writer is not None:
+                self._parquet_writer.close()
+            self._closed = True
+        return self._next_sample_id
+
+    def abort(self):
+        if self._parquet_writer is not None:
+            self._parquet_writer.close()
+        self._closed = True
+        if os.path.exists(self.metadata_path):
+            os.remove(self.metadata_path)
+        remove_existing_shards(self.output_dir, self.dataset_tag)
+
+
 def remove_existing_shards(output_dir, dataset_tag):
     if not os.path.isdir(output_dir):
         return
@@ -713,6 +827,8 @@ def build_arg_parser():
     parser.add_argument("--rank-dataset-tag", dest="rank_dataset_tag", type=str, default="rank_phase1", help="Dataset tag used for per-rank phase-1 outputs")
     parser.add_argument("--skip-phase1", dest="skip_phase1", action="store_true", help="Skip phase 1 and only run the merge over an existing _rank/ tree. Run with `python ...` (no mpirun needed).")
     parser.add_argument("--merge-progress-every", dest="merge_progress_every", type=int, default=10000, help="Print merge progress every N candidates. Set 0 to disable.")
+    parser.add_argument("--merge-sort-chunk-rows", dest="merge_sort_chunk_rows", type=int, default=50000, help="Maximum metadata rows held while externally sorting Phase-1 candidates")
+    parser.add_argument("--merge-max-open-files", dest="merge_max_open_files", type=int, default=128, help="Maximum Phase-1 HDF5 files kept open during the merge")
     parser.add_argument("--selection-seed", dest="selection_seed", type=int, default=0, help="Seed for deterministic hash ordering during global diversity selection")
     return parser
 
@@ -828,19 +944,45 @@ def validate_rank_outputs(
             )
             if not os.path.isfile(parquet_path):
                 raise RuntimeError(f"missing rank metadata: {parquet_path}")
-            rank_meta = pd.read_parquet(
-                parquet_path, columns=["sample_id", "hdf5_file"],
-            )
-            if len(rank_meta) != retained:
+            parquet_file = pq.ParquetFile(parquet_path)
+            rows_seen = 0
+            shard_rows = {}
+            expected_shards = set()
+            for batch in parquet_file.iter_batches(
+                batch_size=65536,
+                columns=["sample_id", "local_index", "hdf5_file"],
+            ):
+                frame = batch.to_pandas()
+                count = len(frame)
+                sample_ids = frame["sample_id"].to_numpy(dtype=np.int64)
+                expected_ids = np.arange(
+                    rows_seen, rows_seen + count, dtype=np.int64,
+                )
+                if not np.array_equal(sample_ids, expected_ids):
+                    raise RuntimeError(
+                        f"rank metadata sample IDs are not canonical in {parquet_path}"
+                    )
+                for sample_id, local_index, shard_name in frame.itertuples(
+                    index=False, name=None,
+                ):
+                    shard_name = str(shard_name)
+                    expected_shards.add(shard_name)
+                    info = shard_rows.setdefault(
+                        shard_name,
+                        {"start": int(sample_id), "count": 0},
+                    )
+                    if int(local_index) != info["count"]:
+                        raise RuntimeError(
+                            f"rank metadata local indices are not canonical in "
+                            f"{parquet_path}"
+                        )
+                    info["count"] += 1
+                rows_seen += count
+            if rows_seen != retained:
                 raise RuntimeError(
                     f"rank metadata count mismatch in {parquet_path}: "
-                    f"{len(rank_meta)} != {retained}"
+                    f"{rows_seen} != {retained}"
                 )
-            if rank_meta["sample_id"].duplicated().any():
-                raise RuntimeError(
-                    f"rank metadata has duplicate sample IDs: {parquet_path}"
-                )
-            expected_shards = set(rank_meta["hdf5_file"].astype(str))
             shard_pattern = re.compile(
                 rf"^{re.escape(rank_dataset_tag)}_[0-9]{{4,}}\.h5$"
             )
@@ -852,6 +994,39 @@ def validate_rank_outputs(
                 raise RuntimeError(
                     f"rank shard set does not match metadata in {rank_dir}"
                 )
+            for shard_name, info in shard_rows.items():
+                shard_path = os.path.join(rank_dir, shard_name)
+                with h5py.File(shard_path, "r") as handle:
+                    if int(handle.attrs.get("format_version", -1)) != DATASET_FORMAT_VERSION:
+                        raise RuntimeError(
+                            f"incompatible rank shard: {shard_path}"
+                        )
+                    required = (
+                        "data/histograms", "data/sample_id", "data/local_index",
+                    )
+                    if any(name not in handle for name in required):
+                        raise RuntimeError(
+                            f"rank shard lacks row identity arrays: {shard_path}"
+                        )
+                    count = int(info["count"])
+                    if handle["data/histograms"].shape[0] != count:
+                        raise RuntimeError(
+                            f"rank shard row count disagrees with metadata: {shard_path}"
+                        )
+                    expected_ids = np.arange(
+                        info["start"], info["start"] + count, dtype=np.int64,
+                    )
+                    if (
+                        not np.array_equal(handle["data/sample_id"][:], expected_ids)
+                        or not np.array_equal(
+                            handle["data/local_index"][:],
+                            np.arange(count, dtype=np.int64),
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"rank shard row identity disagrees with metadata: "
+                            f"{shard_path}"
+                        )
         else:
             parquet_path = os.path.join(
                 rank_dir, f"{rank_dataset_tag}_metadata.parquet",
@@ -902,11 +1077,10 @@ def process_work_units_on_rank(
     moment_bin_counts,
     per_rank_cap,
     rank_output_dir,
+    writer,
 ):
-    """Collect every candidate from this rank without lossy local pruning."""
+    """Extract every candidate and stream it to bounded-size Phase-1 shards."""
     width_stride_pairs = list(zip(box_widths, stride_values))
-    selected_metadata = []
-    selected_pdfs = []
     counters = Counter()
     missing_paths = []
 
@@ -984,19 +1158,17 @@ def process_work_units_on_rank(
                     metadata["moment_bin_key"] = "-".join(str(item) for item in bin_key)
                     metadata["shape_novelty"] = 1.0
                     metadata["retain_reason"] = "phase1_lossless"
-                    selected_metadata.append(metadata)
-                    selected_pdfs.append(pdf)
+                    writer.add(metadata, pdf)
                     counters["phase1_candidates_collected"] += 1
 
-    return selected_metadata, selected_pdfs, counters, missing_paths
+    return counters, missing_paths
 
 
 def write_rank_outputs(
     rank,
     rank_output_dir,
     rank_dataset_tag,
-    selected_metadata,
-    selected_pdfs,
+    num_retained,
     counters,
     missing_paths,
     layout,
@@ -1022,47 +1194,22 @@ def write_rank_outputs(
         "lossless_phase1": True,
     }
 
-    if not selected_metadata:
-        # Still write an empty manifest so the merger knows the rank ran.
-        manifest = {
-            "dataset_tag": rank_dataset_tag,
-            "format_version": DATASET_FORMAT_VERSION,
-            "mpi_rank": int(rank),
-            "rank_work_units": [list(unit) for unit in rank_work_units],
-            "per_rank_cap": int(per_rank_cap),
-            "phase1_configuration": phase1_config,
-            "phase1_signature": phase1_signature,
-            "lossless_phase1": True,
-            "num_retained": 0,
-            "counts": dict(counters),
-            "missing_paths": missing_paths,
-            "elapsed_seconds": time.time() - start_time,
-            "is_checkpoint": False,
-        }
-        manifest_path = os.path.join(rank_output_dir, f"{rank_dataset_tag}_manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2)
-        return 0
-
-    result = materialize_dataset(
-        output_dir=rank_output_dir,
-        dataset_tag=rank_dataset_tag,
-        selected_pdfs=selected_pdfs,
-        selected_metadata=selected_metadata,
-        layout=layout,
-        args=args,
-        counters=counters,
-        missing_paths=missing_paths,
-        fdir=fdir,
-        scalar_configs=scalar_configs,
-        run_ids=run_ids,
-        box_widths=box_widths,
-        stride_values=stride_values,
-        start=start_time,
-        is_checkpoint=False,
-        extra_manifest=extra,
+    manifest = {
+        "dataset_tag": rank_dataset_tag,
+        "format_version": DATASET_FORMAT_VERSION,
+        "num_retained": int(num_retained),
+        "counts": dict(counters),
+        "missing_paths": missing_paths,
+        "elapsed_seconds": time.time() - start_time,
+        "is_checkpoint": False,
+        **extra,
+    }
+    manifest_path = os.path.join(
+        rank_output_dir, f"{rank_dataset_tag}_manifest.json",
     )
-    return result[3] if result is not None else 0
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+    return int(num_retained)
 
 
 def _physical_candidate_key(metadata):
@@ -1086,108 +1233,134 @@ def _candidate_sort_key(metadata, selection_seed=0):
     return (hashlib.sha256(payload).digest(), physical_key)
 
 
-def _iter_one_rank_candidates(
-    rank_dir,
+def _write_sorted_candidate_runs(
+    rank_dirs,
     rank_dataset_tag,
-    selection_seed=0,
-    expected_num_bins=None,
+    selection_seed,
+    sort_chunk_rows,
+    temporary_dir,
 ):
-    """Yield one rank's candidates in deterministic hash order."""
-    drop_cols_final = {"sample_id", "shard_id", "local_index", "hdf5_file"}
+    """External-sort bounded metadata chunks and return their Parquet paths."""
     stale_cols = ("moment_bin_0", "moment_bin_1", "moment_bin_2", "moment_bin_3",
                   "moment_bin_4", "moment_bin_key", "shape_novelty", "retain_reason")
     int_cols = ("run_id", "timestep", "box_width", "stride",
                 "center_i", "center_j", "center_k", "n_dns_cells")
-
-    parquet_path = os.path.join(rank_dir, f"{rank_dataset_tag}_metadata.parquet")
-    if not os.path.isfile(parquet_path):
-        return
-    meta_df = pd.read_parquet(parquet_path)
-    if meta_df.empty:
-        return
-    if meta_df["sample_id"].duplicated().any():
-        raise RuntimeError(f"duplicate rank sample IDs in {parquet_path}")
-    if meta_df.duplicated(subset=["hdf5_file", "local_index"]).any():
-        raise RuntimeError(f"duplicate rank HDF5 row mappings in {parquet_path}")
-
-    cols_to_drop = [c for c in stale_cols if c in meta_df.columns]
-    if cols_to_drop:
-        meta_df = meta_df.drop(columns=cols_to_drop)
-    for col in int_cols:
-        if col in meta_df.columns:
-            meta_df[col] = meta_df[col].astype(int)
-    meta_df["scalar_config"] = meta_df["scalar_config"].astype(str)
-    meta_df["_selection_key"] = [
-        _candidate_sort_key(record, selection_seed)[0].hex()
-        for record in meta_df.to_dict(orient="records")
-    ]
-    meta_df = meta_df.sort_values(
-        ["_selection_key", "run_id", "scalar_config", "timestep", "box_width",
-         "center_i", "center_j", "center_k"],
-        kind="stable",
-    ).drop(columns="_selection_key").reset_index(drop=True)
-
-    hdf5_file_col = meta_df["hdf5_file"].astype(str).to_numpy()
-    local_index_col = meta_df["local_index"].astype(int).to_numpy()
-    sample_id_col = meta_df["sample_id"].astype(int).to_numpy()
-    keep_cols = [column for column in meta_df.columns if column not in drop_cols_final]
-    records = meta_df[keep_cols].to_dict(orient="records")
-    handles = {}
-    try:
-        for index, metadata in enumerate(records):
-            shard_name = hdf5_file_col[index]
-            handle = handles.get(shard_name)
-            if handle is None:
-                handle = h5py.File(os.path.join(rank_dir, shard_name), "r")
-                if handle.attrs.get("format_version") != DATASET_FORMAT_VERSION:
-                    handle.close()
-                    raise RuntimeError(f"incompatible rank shard: {shard_name}")
-                if "bins/cell_centroid_a" not in handle or "bins/cell_centroid_b" not in handle:
-                    handle.close()
-                    raise RuntimeError(
-                        f"rank shard lacks clipped-simplex geometry: {shard_name}"
-                    )
-                histograms = handle["data/histograms"]
-                if "data/sample_id" not in handle or "data/local_index" not in handle:
-                    handle.close()
-                    raise RuntimeError(
-                        f"rank shard lacks row identity arrays: {shard_name}"
-                    )
-                if (
-                    histograms.ndim != 3
-                    or (
-                        expected_num_bins is not None
-                        and histograms.shape[1:] != (
-                            expected_num_bins, expected_num_bins,
-                        )
-                    )
-                ):
-                    handle.close()
-                    raise RuntimeError(
-                        f"rank shard histogram shape is incompatible: "
-                        f"{shard_name} {histograms.shape}"
-                    )
-                handles[shard_name] = handle
-            if not 0 <= local_index_col[index] < handle["data/histograms"].shape[0]:
-                raise RuntimeError(
-                    f"rank metadata local_index is out of range in {shard_name}"
-                )
-            local_index = local_index_col[index]
-            if (
-                int(handle["data/sample_id"][local_index])
-                != sample_id_col[index]
-                or int(handle["data/local_index"][local_index]) != local_index
-            ):
-                raise RuntimeError(
-                    f"rank HDF5 row identity disagrees with metadata in {shard_name}"
-                )
-            pdf = np.asarray(
-                handle["data/histograms"][local_index], dtype=np.float32,
+    required = {
+        "sample_id", "local_index", "hdf5_file", "scalar_config",
+        "run_id", "timestep", "box_width", "center_i", "center_j", "center_k",
+    }
+    run_paths = []
+    run_number = 0
+    for rank_dir in rank_dirs:
+        parquet_path = os.path.join(
+            rank_dir, f"{rank_dataset_tag}_metadata.parquet",
+        )
+        if not os.path.isfile(parquet_path):
+            continue
+        parquet_file = pq.ParquetFile(parquet_path)
+        if not required.issubset(parquet_file.schema.names):
+            missing = sorted(required - set(parquet_file.schema.names))
+            raise RuntimeError(
+                f"rank metadata lacks required columns {missing}: {parquet_path}"
             )
-            yield _candidate_sort_key(metadata, selection_seed), metadata, pdf
-    finally:
-        for handle in handles.values():
+        for batch in parquet_file.iter_batches(batch_size=sort_chunk_rows):
+            frame = batch.to_pandas()
+            if frame.empty:
+                continue
+            cols_to_drop = [column for column in stale_cols if column in frame]
+            if cols_to_drop:
+                frame = frame.drop(columns=cols_to_drop)
+            for column in int_cols:
+                if column in frame:
+                    frame[column] = frame[column].astype(int)
+            if frame[list(required)].isna().any().any():
+                raise RuntimeError(f"null values in rank metadata: {parquet_path}")
+            frame["scalar_config"] = frame["scalar_config"].astype(str)
+            frame["_selection_digest"] = [
+                _candidate_sort_key(record, selection_seed)[0].hex()
+                for record in frame.to_dict(orient="records")
+            ]
+            frame["_rank_dir"] = os.path.abspath(rank_dir)
+            frame = frame.sort_values(
+                [
+                    "_selection_digest", "run_id", "scalar_config", "timestep",
+                    "box_width", "center_i", "center_j", "center_k",
+                ],
+                kind="stable",
+            ).reset_index(drop=True)
+            run_path = os.path.join(
+                temporary_dir, f"candidate_run_{run_number:06d}.parquet",
+            )
+            frame.to_parquet(run_path, index=False)
+            run_paths.append(run_path)
+            run_number += 1
+    return run_paths
+
+
+def _iter_sorted_metadata_run(run_path, batch_size=512):
+    parquet_file = pq.ParquetFile(run_path)
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        for metadata in batch.to_pandas().to_dict(orient="records"):
+            key = (
+                bytes.fromhex(metadata["_selection_digest"]),
+                _physical_candidate_key(metadata),
+            )
+            yield key, metadata
+
+
+def _candidate_pdf(metadata, handles, expected_num_bins, max_open_handles=32):
+    rank_dir = metadata["_rank_dir"]
+    shard_name = str(metadata["hdf5_file"])
+    shard_path = os.path.join(rank_dir, shard_name)
+    handle = handles.pop(shard_path, None)
+    if handle is None:
+        handle = h5py.File(shard_path, "r")
+        if int(handle.attrs.get("format_version", -1)) != DATASET_FORMAT_VERSION:
             handle.close()
+            raise RuntimeError(f"incompatible rank shard: {shard_name}")
+        if "bins/cell_centroid_a" not in handle or "bins/cell_centroid_b" not in handle:
+            handle.close()
+            raise RuntimeError(
+                f"rank shard lacks clipped-simplex geometry: {shard_name}"
+            )
+        if "data/sample_id" not in handle or "data/local_index" not in handle:
+            handle.close()
+            raise RuntimeError(
+                f"rank shard lacks row identity arrays: {shard_name}"
+            )
+        histograms = handle["data/histograms"]
+        if (
+            histograms.ndim != 3
+            or (
+                expected_num_bins is not None
+                and histograms.shape[1:] != (
+                    expected_num_bins, expected_num_bins,
+                )
+            )
+        ):
+            handle.close()
+            raise RuntimeError(
+                f"rank shard histogram shape is incompatible: "
+                f"{shard_name} {histograms.shape}"
+            )
+    handles[shard_path] = handle
+    while len(handles) > max_open_handles:
+        _, oldest = handles.popitem(last=False)
+        oldest.close()
+
+    local_index = int(metadata["local_index"])
+    if not 0 <= local_index < handle["data/histograms"].shape[0]:
+        raise RuntimeError(
+            f"rank metadata local_index is out of range in {shard_name}"
+        )
+    if (
+        int(handle["data/sample_id"][local_index]) != int(metadata["sample_id"])
+        or int(handle["data/local_index"][local_index]) != local_index
+    ):
+        raise RuntimeError(
+            f"rank HDF5 row identity disagrees with metadata in {shard_name}"
+        )
+    return np.asarray(handle["data/histograms"][local_index], dtype=np.float32)
 
 
 def iter_rank_candidates(
@@ -1195,34 +1368,70 @@ def iter_rank_candidates(
     rank_dataset_tag,
     selection_seed=0,
     expected_num_bins=None,
+    sort_chunk_rows=50000,
+    max_open_files=128,
 ):
-    """K-way merge candidates into rank-count-independent hash order."""
-    iterators = [
-        iter(_iter_one_rank_candidates(
-            rank_dir, rank_dataset_tag, selection_seed=selection_seed,
-            expected_num_bins=expected_num_bins,
-        ))
-        for rank_dir in rank_dirs
-    ]
-    heap = []
-    for rank_index, iterator in enumerate(iterators):
-        try:
-            key, metadata, pdf = next(iterator)
-        except StopIteration:
-            continue
-        heapq.heappush(heap, (key, rank_index, metadata, pdf, iterator))
+    """External-sort and merge candidates in rank-count-independent hash order."""
+    if sort_chunk_rows <= 0:
+        raise ValueError("sort_chunk_rows must be positive")
+    if max_open_files <= 0:
+        raise ValueError("max_open_files must be positive")
+    if not rank_dirs:
+        return
+    temporary_parent = os.path.dirname(os.path.abspath(rank_dirs[0]))
+    handles = OrderedDict()
+    drop_cols_final = {
+        "sample_id", "shard_id", "local_index", "hdf5_file",
+        "_selection_digest", "_rank_dir",
+    }
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".candidate-sort-", dir=temporary_parent,
+        ) as temporary_dir:
+            run_paths = _write_sorted_candidate_runs(
+                rank_dirs,
+                rank_dataset_tag,
+                selection_seed,
+                sort_chunk_rows,
+                temporary_dir,
+            )
+            iterators = [
+                iter(_iter_sorted_metadata_run(run_path))
+                for run_path in run_paths
+            ]
+            heap = []
+            for run_index, iterator in enumerate(iterators):
+                try:
+                    key, metadata = next(iterator)
+                except StopIteration:
+                    continue
+                heapq.heappush(
+                    heap, (key, run_index, metadata, iterator),
+                )
 
-    while heap:
-        _, rank_index, metadata, pdf, iterator = heapq.heappop(heap)
-        yield metadata, pdf
-        try:
-            key, next_metadata, next_pdf = next(iterator)
-        except StopIteration:
-            continue
-        heapq.heappush(
-            heap,
-            (key, rank_index, next_metadata, next_pdf, iterator),
-        )
+            while heap:
+                _, run_index, metadata, iterator = heapq.heappop(heap)
+                pdf = _candidate_pdf(
+                    metadata,
+                    handles,
+                    expected_num_bins,
+                    max_open_handles=max_open_files,
+                )
+                clean_metadata = {
+                    key: value for key, value in metadata.items()
+                    if key not in drop_cols_final
+                }
+                yield clean_metadata, pdf
+                try:
+                    next_key, next_metadata = next(iterator)
+                except StopIteration:
+                    continue
+                heapq.heappush(
+                    heap, (next_key, run_index, next_metadata, iterator),
+                )
+    finally:
+        for handle in handles.values():
+            handle.close()
 
 
 def merge_per_rank_outputs(
@@ -1257,6 +1466,8 @@ def merge_per_rank_outputs(
     for metadata, pdf in iter_rank_candidates(
         rank_dirs, rank_dataset_tag, selection_seed=args.selection_seed,
         expected_num_bins=int(args.pdf_bins),
+        sort_chunk_rows=int(args.merge_sort_chunk_rows),
+        max_open_files=int(args.merge_max_open_files),
     ):
         counters["candidates_seen"] += 1
         moment_values = tuple(metadata[name] for name in MOMENT_NAMES)
@@ -1440,8 +1651,13 @@ def main():
         raise ValueError("--nx and --npx must be positive and nx must be divisible by npx")
     if args.tjump <= 0 or args.tend <= args.tstart:
         raise ValueError("timesteps require --tjump > 0 and --tend > --tstart")
-    if args.max_per_moment_bin <= 0 or args.hdf5_shard_size <= 0:
-        raise ValueError("moment-bin and HDF5 shard caps must be positive")
+    if (
+        args.max_per_moment_bin <= 0
+        or args.hdf5_shard_size <= 0
+        or args.merge_sort_chunk_rows <= 0
+        or args.merge_max_open_files <= 0
+    ):
+        raise ValueError("moment-bin, shard, and merge resource caps must be positive")
     if args.variance_limit <= 0.0 or args.covariance_limit <= 0.0:
         raise ValueError("variance and covariance limits must be positive")
     if args.scalar_tolerance < 0.0:
@@ -1533,28 +1749,40 @@ def main():
                 flush=True,
             )
 
-        rank_selected_metadata, rank_selected_pdfs, rank_counters, rank_missing = process_work_units_on_rank(
-            work_units=rank_units,
-            rank=rank,
-            size=size,
-            fdir=fdir,
-            args=args,
-            layout=layout,
-            shape_masks=shape_masks,
-            pad_width=pad_width,
-            box_widths=box_widths,
-            stride_values=stride_values,
-            moment_bin_counts=moment_bin_counts,
-            per_rank_cap=per_rank_cap,
-            rank_output_dir=rank_output_dir,
+        rank_writer = StreamingRankWriter(
+            rank_output_dir,
+            args.rank_dataset_tag,
+            layout,
+            args.hdf5_shard_size,
+            args.compression,
         )
+        try:
+            rank_counters, rank_missing = process_work_units_on_rank(
+                work_units=rank_units,
+                rank=rank,
+                size=size,
+                fdir=fdir,
+                args=args,
+                layout=layout,
+                shape_masks=shape_masks,
+                pad_width=pad_width,
+                box_widths=box_widths,
+                stride_values=stride_values,
+                moment_bin_counts=moment_bin_counts,
+                per_rank_cap=per_rank_cap,
+                rank_output_dir=rank_output_dir,
+                writer=rank_writer,
+            )
+            rank_candidate_count = rank_writer.close()
+        except Exception:
+            rank_writer.abort()
+            raise
 
         rank_kept = write_rank_outputs(
             rank=rank,
             rank_output_dir=rank_output_dir,
             rank_dataset_tag=args.rank_dataset_tag,
-            selected_metadata=rank_selected_metadata,
-            selected_pdfs=rank_selected_pdfs,
+            num_retained=rank_candidate_count,
             counters=rank_counters,
             missing_paths=rank_missing,
             layout=layout,
@@ -1571,10 +1799,6 @@ def main():
             phase1_signature=phase1_signature,
         )
         print(f"[rank {rank:03d}] phase 1 done: retained={rank_kept} elapsed={time.time()-start_time:.1f}s", flush=True)
-
-        # Free phase-1 memory before the barrier so the node has headroom while
-        # other ranks finish.
-        del rank_selected_metadata, rank_selected_pdfs
 
         comm.Barrier()
 

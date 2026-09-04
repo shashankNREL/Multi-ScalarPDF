@@ -73,6 +73,10 @@ def load_metadata(parquet_path: str) -> pd.DataFrame:
         raise KeyError(f"parquet missing required columns: {missing}")
 
     result = renamed.reset_index(drop=True)
+    if result[SCALAR_CONFIG_COL].isna().any():
+        raise ValueError("scalar_config values must not be null")
+    if result[HDF5_FILE_COL].isna().any():
+        raise ValueError("hdf5_file values must not be null")
     numeric_columns = [
         *MOMENT_COLS, SAMPLE_ID_COL, LOCAL_INDEX_COL,
         "run_id", TIMESTEP_COL, "box_width",
@@ -165,6 +169,7 @@ class HybridPDFDataset(Dataset):
         cache_histograms: bool = False,
         flat_histograms: bool = False,
         max_moment_discrepancy: float | None = 0.05,
+        grid_override: Optional[BinGrid] = None,
     ) -> None:
         if input_moments not in (4, 5):
             raise ValueError(f"input_moments must be 4 or 5, got {input_moments}")
@@ -194,8 +199,12 @@ class HybridPDFDataset(Dataset):
             self._indices = np.asarray(list(indices), dtype=np.int64)
         self.meta = self._meta_all.iloc[self._indices].reset_index(drop=True)
 
-        self.grid: BinGrid = bin_grid(num_bins=num_bins, zst=zst, uniform=uniform_bins)
-        if int(self._meta_all.shape[0]) > 0:
+        self.grid: BinGrid = (
+            grid_override
+            if grid_override is not None
+            else bin_grid(num_bins=num_bins, zst=zst, uniform=uniform_bins)
+        )
+        if int(self._meta_all.shape[0]) > 0 and grid_override is None:
             self._check_grid_matches_first_shard()
 
         # Precompute the flat in-simplex index (used when flat_histograms=True
@@ -253,6 +262,11 @@ class HybridPDFDataset(Dataset):
         else:
             handle = self._open_shard(shard_filename)
             hist = np.asarray(handle["data/histograms"][local_index], dtype=np.float32)
+            if hist.shape != self.grid.simplex_mask.shape:
+                raise RuntimeError(
+                    f"Histogram at {shard_filename}[{local_index}] has shape "
+                    f"{hist.shape}, expected {self.grid.simplex_mask.shape}"
+                )
             if not np.isfinite(hist).all() or np.any(hist < 0.0):
                 raise RuntimeError(
                     f"Histogram at {shard_filename}[{local_index}] contains "
@@ -368,6 +382,12 @@ def validate_dataset(
             "format-version-2 metadata lacks required histogram moment fields: "
             f"{missing_hist_moments}"
         )
+    derived_columns = [*histogram_moment_columns, "moment_abs_err_max"]
+    derived_values = meta[derived_columns].to_numpy(dtype=np.float64)
+    if not np.isfinite(derived_values).all():
+        raise ValueError("histogram moment metadata must be finite")
+    if np.any(meta["moment_abs_err_max"].to_numpy(dtype=np.float64) < 0.0):
+        raise ValueError("moment_abs_err_max must be non-negative")
 
     for shard_name, shard_meta in meta.groupby(HDF5_FILE_COL, sort=True):
         shard_path = root / str(shard_name)
@@ -409,13 +429,22 @@ def validate_dataset(
                 )
 
             ordered = shard_meta.sort_values(LOCAL_INDEX_COL)
-            if "data/sample_id" in handle:
-                stored_ids = np.asarray(handle["data/sample_id"][:], dtype=np.int64)
-                metadata_ids = ordered[SAMPLE_ID_COL].to_numpy(dtype=np.int64)
-                if not np.array_equal(stored_ids, metadata_ids):
-                    raise ValueError(
-                        f"{shard_path} sample_id values disagree with Parquet metadata"
-                    )
+            if "data/sample_id" not in handle or "data/local_index" not in handle:
+                raise KeyError(
+                    f"{shard_path} lacks required format-version-2 row identity arrays"
+                )
+            stored_ids = np.asarray(handle["data/sample_id"][:], dtype=np.int64)
+            stored_local = np.asarray(handle["data/local_index"][:], dtype=np.int64)
+            metadata_ids = ordered[SAMPLE_ID_COL].to_numpy(dtype=np.int64)
+            if (
+                stored_ids.shape != expected.shape
+                or stored_local.shape != expected.shape
+                or not np.array_equal(stored_ids, metadata_ids)
+                or not np.array_equal(stored_local, expected)
+            ):
+                raise ValueError(
+                    f"{shard_path} row identity arrays disagree with Parquet metadata"
+                )
 
             chunk_rows = histograms.chunks[0] if histograms.chunks else 256
             for start in range(0, histograms.shape[0], chunk_rows):
@@ -497,6 +526,10 @@ def validate_dataset(
                 )
                 checked_rows += len(chunk)
 
+    if checked_rows != len(meta):
+        raise ValueError(
+            f"validated {checked_rows} HDF5 rows for {len(meta)} metadata records"
+        )
     if worst_sum_error > sum_atol:
         raise ValueError(
             f"histogram normalization error {worst_sum_error:.6g} exceeds {sum_atol}"

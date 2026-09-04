@@ -7,13 +7,15 @@ import numpy as np
 import pandas as pd
 import torch
 import h5py
+import joblib
 from sklearn.preprocessing import RobustScaler
 
 import EnsightPDFHybridDataset as serial_sampler
 import EnsightPDFHybridDatasetMPI as sampler
-from dirichlet_mdn.bin_grid import bin_grid
-from dirichlet_mdn.data import validate_dataset
+from dirichlet_mdn.bin_grid import bin_grid, load_bin_grid_from_hdf5
+from dirichlet_mdn.data import load_metadata, validate_dataset
 from dirichlet_mdn.dataset_diversity import variance_regime
+from dirichlet_mdn.evaluate import _load_context
 from dirichlet_mdn.losses import HistogramNLL
 from dirichlet_mdn.metrics import joint_jsd, joint_l1
 from dirichlet_mdn.model import DirichletMDN
@@ -116,12 +118,21 @@ class SplitTests(unittest.TestCase):
         split = make_split(_metadata(), ratios=(0.8, 0.2, 0.0))
         self.assertEqual(len(split.test), 0)
 
-    def test_holdout_test_contains_only_named_configuration(self):
+    def test_holdout_rejects_shared_physical_runs(self):
         meta = _metadata()
+        with self.assertRaisesRegex(ValueError, "pure configuration holdout"):
+            make_split(meta, holdout_config="C")
+
+    def test_holdout_test_is_pure_and_run_isolated(self):
+        meta = _metadata()
+        meta.loc[meta["scalar_config"] == "C", "run_id"] += 100
         split = make_split(meta, holdout_config="C")
         self.assertEqual(set(meta.iloc[split.test]["scalar_config"]), {"C"})
         self.assertNotIn("C", set(meta.iloc[split.train]["scalar_config"]))
         self.assertNotIn("C", set(meta.iloc[split.val]["scalar_config"]))
+        test_runs = set(meta.iloc[split.test]["run_id"])
+        self.assertFalse(test_runs & set(meta.iloc[split.train]["run_id"]))
+        self.assertFalse(test_runs & set(meta.iloc[split.val]["run_id"]))
 
     def test_fingerprint_mismatch_is_rejected(self):
         meta = _metadata()
@@ -139,6 +150,11 @@ class ModelAndLossTests(unittest.TestCase):
             DirichletMDN(4, alpha_min=0.5)
         _, alpha = DirichletMDN(4, alpha_min=1.0)(torch.zeros(2, 4))
         self.assertTrue(torch.all(alpha >= 1.0))
+        legacy = DirichletMDN(
+            4, alpha_min=0.5, allow_alpha_below_one=True,
+        )
+        _, legacy_alpha = legacy(torch.zeros(1, 4))
+        self.assertTrue(torch.all(legacy_alpha >= 0.5))
 
     def test_nll_normalizes_targets_and_rejects_outside_mass(self):
         grid = bin_grid(num_bins=8, zst=0.1)
@@ -181,8 +197,97 @@ class ArtifactAndDiagnosticTests(unittest.TestCase):
         self.assertEqual(result["frac_well_mixed_lt_0_1"], 0.5)
         self.assertEqual(result["frac_highly_segregated_gt_0_8"], 0.5)
 
+    def test_legacy_evaluation_requires_opt_in_and_loads_old_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grid = bin_grid(num_bins=8, zst=0.1)
+            shard = root / "legacy.h5"
+            legacy_area = np.outer(
+                np.diff(grid.edges_a), np.diff(grid.edges_b),
+            )
+            center_a, center_b = np.meshgrid(
+                grid.centers_a, grid.centers_b, indexing="ij",
+            )
+            legacy_mask = center_a + center_b <= 1.0 + 1e-12
+            with h5py.File(shard, "w") as handle:
+                bins = handle.create_group("bins")
+                bins.create_dataset("centers_a", data=grid.centers_a)
+                bins.create_dataset("centers_b", data=grid.centers_b)
+                bins.create_dataset("edges_a", data=grid.edges_a)
+                bins.create_dataset("edges_b", data=grid.edges_b)
+                bins.create_dataset("cell_area", data=legacy_area)
+                bins.create_dataset(
+                    "simplex_mask", data=legacy_mask.astype(np.uint8),
+                )
+            parquet = root / "metadata.parquet"
+            pd.DataFrame([{
+                "scalar_config": "A", "run_id": 0, "timestep": 1,
+                "box_width": 2, "mean_a": 0.2, "var_a": 0.01,
+                "mean_b": 0.3, "var_b": 0.01, "cov_ab": 0.0,
+                "sample_id": 0, "local_index": 0, "hdf5_file": shard.name,
+            }]).to_parquet(parquet, index=False)
+            config = {
+                "parquet": str(parquet), "hdf5_dir": str(root),
+                "input_moments": 4, "K": 1, "hidden": 8,
+                "alpha_min": 1e-3, "alpha_clip": 1e3,
+                "device": "cpu", "num_bins": 8, "zst": 0.1,
+                "uniform_bins": False,
+            }
+            (root / "manifest.json").write_text(json.dumps({"config": config}))
+            model = DirichletMDN(
+                4, K=1, hidden=8, alpha_min=1e-3,
+                allow_alpha_below_one=True,
+            )
+            torch.save(
+                {"model_state_dict": model.state_dict()},
+                root / "model_best.pt",
+            )
+            joblib.dump(
+                RobustScaler().fit(np.array([[0.0] * 4, [1.0] * 4])),
+                root / "scaler.pkl",
+            )
+            with self.assertRaisesRegex(ValueError, "allow-legacy-artifacts"):
+                _load_context(root)
+            with self.assertWarnsRegex(RuntimeWarning, "not directly comparable"):
+                context = _load_context(root, allow_legacy_artifacts=True)
+            self.assertTrue(context.legacy_artifacts)
+            self.assertEqual(context.model.alpha_min, 1e-3)
+            self.assertTrue(
+                np.array_equal(context.grid.cell_centroid_a, center_a)
+            )
+
 
 class RankProvenanceTests(unittest.TestCase):
+    def test_phase1_writer_bounds_shards_and_preserves_identity(self):
+        layout = sampler.get_histogram_layout(4)
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = sampler.StreamingRankWriter(
+                tmp, "phase", layout, shard_size=2, compression=None,
+            )
+            for index in range(5):
+                writer.add(
+                    {
+                        "scalar_config": "A", "run_id": index, "timestep": 1,
+                        "box_width": 2, "stride": 1, "center_i": 0,
+                        "center_j": 0, "center_k": 0, "n_dns_cells": 1,
+                    },
+                    np.full((4, 4), 1.0 / 16.0, dtype=np.float32),
+                )
+            self.assertEqual(writer.close(), 5)
+            metadata = pd.read_parquet(Path(tmp) / "phase_metadata.parquet")
+            self.assertEqual(metadata["sample_id"].tolist(), list(range(5)))
+            self.assertEqual(len(list(Path(tmp).glob("phase_*.h5"))), 3)
+            for shard_name, rows in metadata.groupby("hdf5_file", sort=False):
+                with h5py.File(Path(tmp) / shard_name, "r") as handle:
+                    self.assertEqual(
+                        handle["data/sample_id"][:].tolist(),
+                        rows["sample_id"].tolist(),
+                    )
+                    self.assertEqual(
+                        handle["data/local_index"][:].tolist(),
+                        list(range(len(rows))),
+                    )
+
     def test_rank_output_validation_checks_work_unit_coverage(self):
         signature = "abc"
         with tempfile.TemporaryDirectory() as tmp:
@@ -295,6 +400,7 @@ class RankProvenanceTests(unittest.TestCase):
                 for metadata, _ in sampler.iter_rank_candidates(
                     write_partition(root / "one", [[0, 1, 2, 3]]),
                     "phase", selection_seed=11, expected_num_bins=4,
+                    sort_chunk_rows=1,
                 )
             ]
             order_two = [
@@ -302,6 +408,7 @@ class RankProvenanceTests(unittest.TestCase):
                 for metadata, _ in sampler.iter_rank_candidates(
                     write_partition(root / "two", [[0, 2], [1, 3]]),
                     "phase", selection_seed=11, expected_num_bins=4,
+                    sort_chunk_rows=1,
                 )
             ]
             self.assertEqual(order_one, order_two)
@@ -355,6 +462,7 @@ class DatasetValidationTests(unittest.TestCase):
                 data = handle.create_group("data")
                 data.create_dataset("histograms", data=hist[None, ...])
                 data.create_dataset("sample_id", data=np.array([0]))
+                data.create_dataset("local_index", data=np.array([0]))
             result = validate_dataset(
                 str(parquet), str(root), num_bins=8, zst=0.1,
             )
@@ -369,6 +477,52 @@ class DatasetValidationTests(unittest.TestCase):
                 validate_dataset(
                     str(parquet), str(root), num_bins=8, zst=0.1,
                 )
+            with h5py.File(root / row["hdf5_file"], "r+") as handle:
+                handle["data/histograms"][0] = hist
+                del handle["data/local_index"]
+            with self.assertRaisesRegex(KeyError, "row identity arrays"):
+                validate_dataset(
+                    str(parquet), str(root), num_bins=8, zst=0.1,
+                )
+            with h5py.File(root / row["hdf5_file"], "r+") as handle:
+                handle["data"].create_dataset(
+                    "local_index", data=np.array([0]),
+                )
+
+            bad_row = dict(row)
+            bad_row["hist_mean_a"] = np.nan
+            pd.DataFrame([bad_row]).to_parquet(parquet, index=False)
+            with self.assertRaisesRegex(ValueError, "must be finite"):
+                validate_dataset(
+                    str(parquet), str(root), num_bins=8, zst=0.1,
+                )
+
+            bad_row = dict(row)
+            bad_row["hdf5_file"] = None
+            pd.DataFrame([bad_row]).to_parquet(parquet, index=False)
+            with self.assertRaisesRegex(ValueError, "must not be null"):
+                load_metadata(str(parquet))
+
+    def test_legacy_grid_loader_uses_stored_center_geometry(self):
+        grid = bin_grid(num_bins=8, zst=0.1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.h5"
+            with h5py.File(path, "w") as handle:
+                bins = handle.create_group("bins")
+                bins.create_dataset("centers_a", data=grid.centers_a)
+                bins.create_dataset("centers_b", data=grid.centers_b)
+                bins.create_dataset("edges_a", data=grid.edges_a)
+                bins.create_dataset("edges_b", data=grid.edges_b)
+                bins.create_dataset("cell_area", data=grid.cell_area)
+                bins.create_dataset(
+                    "simplex_mask", data=grid.simplex_mask.astype(np.uint8),
+                )
+            loaded = load_bin_grid_from_hdf5(str(path), zst=0.1)
+            centers_a, centers_b = np.meshgrid(
+                grid.centers_a, grid.centers_b, indexing="ij",
+            )
+            self.assertTrue(np.array_equal(loaded.cell_centroid_a, centers_a))
+            self.assertTrue(np.array_equal(loaded.cell_centroid_b, centers_b))
 
 
 if __name__ == "__main__":

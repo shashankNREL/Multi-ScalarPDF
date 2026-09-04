@@ -111,6 +111,12 @@ pixi run evaluate dirichlet_mdn_runs/<run_dir>
 pixi run tensorboard
 ```
 
+New run manifests use artifact schema version 2. Historical runs are rejected by
+default; trusted pre-v2 artifacts can be inspected with
+`python -m dirichlet_mdn.evaluate --run-dir <run_dir> --allow-legacy-artifacts`.
+Their stored legacy grid is preserved, so those metrics are not directly comparable
+with version-2 runs.
+
 ### Task reference
 
 | Task | Purpose |

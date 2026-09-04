@@ -337,7 +337,10 @@ It records the fixes approved after `CODE_REVIEW.md`.
 - **B2/B3 — honest splits:** counts respect zero ratios; a named holdout is the
   only test configuration; ordinary splits partition global physical `run_id`
   values once across every scalar configuration. Timestep fallback was removed
-  because it leaked one evolution across partitions.
+  because it leaked one evolution across partitions. A pure configuration
+  holdout is rejected when its run IDs also occur in other configurations,
+  because pure holdout, complete row coverage, and run isolation are then
+  mathematically incompatible.
 - **B4/H1 — one simplex convention:** rectangular cells are clipped against
   the physical triangle. Stored areas and centroids describe the clipped
   polygons, and area sums to 0.5. Writing, loading, NLL, rendering, moments,
@@ -348,6 +351,8 @@ It records the fixes approved after `CODE_REVIEW.md`.
   The merge rejects stale, missing, extra, lossy, or configuration-incompatible
   rank output. Candidates are globally ordered by a seeded SHA-256 hash of
   physical identity, so changing rank count does not change arrival order.
+  Phase 1 writes bounded-size shards incrementally; Phase 2 external-sorts
+  bounded metadata chunks and uses a configurable bounded HDF5 handle cache.
 - **H3 — safe publication:** cleanup matches only canonical shard names for the
   exact dataset tag. New output is built in a staging directory, data files are
   renamed into place, and the manifest is published last as the commit marker.
@@ -392,7 +397,7 @@ It records the fixes approved after `CODE_REVIEW.md`.
 
 ### Validation and review follow-up
 
-- All 19 deterministic regression tests pass, including exact clipped-simplex
+- All 23 deterministic regression tests pass, including exact clipped-simplex
   area, serial/MPI identity, global-run split isolation, rank provenance,
   zero-safe metrics, and exhaustive synthetic-dataset validation. The validator
   test also alters an HDF5 row after writing and confirms that the stored
@@ -411,6 +416,12 @@ It records the fixes approved after `CODE_REVIEW.md`.
   made dataset-bound verification accept non-default grid arguments, and
   removed the remaining proposal claims of exact moment enforcement or exact
   subsumption of the analytical hierarchy.
+- Final follow-up rejects null shard/configuration names, non-finite derived
+  moments, missing row-identity arrays, incomplete HDF5 coverage, and shared-run
+  configuration holdouts. New runs declare artifact schema version 2. Older
+  runs require the explicit `evaluate --allow-legacy-artifacts` option, which
+  loads their stored grid and scaler and warns that their metrics are not
+  comparable with corrected version-2 runs.
 
 ### Deviations from the approved remediation plan
 
@@ -424,13 +435,14 @@ It records the fixes approved after `CODE_REVIEW.md`.
    - Consequence: the model is stable and its limitation is explicit, but exact
      edge/corner atoms and below-one Dirichlets are unsupported.
 
-2. **Lossless Phase 1 is not yet incrementally written.**
+2. **Lossless Phase 1 initially used rank-wide buffering.**
    - Planned preference: a lossless collector with bounded memory.
-   - Implemented: lossless collection is buffered per rank, then written.
-   - Reason: correctness and rank-count independence were prioritized over a
-     larger streaming-writer refactor.
-   - Consequence: candidate loss is fixed, but large jobs can use substantially
-     more rank memory. The LaTeX guide warns operators explicitly.
+   - Initial implementation: lossless collection was buffered per rank.
+   - Follow-up: candidates now flush at `--hdf5-shard-size`, while merge metadata
+     is externally sorted in `--merge-sort-chunk-rows` batches.
+   - Consequence: memory is bounded by one extraction shard per rank and one
+     metadata sort chunk on rank 0; the complete lossless candidate set still
+     requires corresponding disk space.
 
 3. **Downstream closure error is deferred rather than fabricated.**
    - Planned: report conditional reaction-rate error.
@@ -446,7 +458,10 @@ It records the fixes approved after `CODE_REVIEW.md`.
      validation rejects legacy geometry.
    - Reason: discarded boundary mass cannot be reconstructed from normalized
      legacy histograms.
-   - Consequence: datasets must be regenerated before training.
+   - Consequence: datasets must be regenerated before new training. Existing
+     historical runs can still be evaluated only through the explicit legacy
+     option, using their stored geometry; those metrics are labeled
+     non-comparable with corrected runs.
 
 5. **Validation in this change uses synthetic data only.**
    - Planned: also regenerate and train on DNS data.

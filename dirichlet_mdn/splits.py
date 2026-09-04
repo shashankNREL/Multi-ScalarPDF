@@ -125,6 +125,22 @@ def make_split(
                 f"holdout_config={holdout_config!r} not present in metadata "
                 f"(have {sorted(meta['scalar_config'].unique())})"
             )
+        holdout_runs = set(
+            int(value) for value in
+            meta.loc[meta["scalar_config"] == holdout_config, "run_id"].unique()
+        )
+        other_runs = set(
+            int(value) for value in
+            meta.loc[meta["scalar_config"] != holdout_config, "run_id"].unique()
+        )
+        shared_runs = sorted(holdout_runs & other_runs)
+        if shared_runs:
+            raise ValueError(
+                "a pure configuration holdout cannot also isolate physical runs: "
+                f"{len(shared_runs)} run_id value(s) occur in both {holdout_config!r} "
+                "and non-held configurations. Use independent run IDs for the "
+                "held configuration or use the ordinary global-run split."
+            )
 
     eligible = (
         meta[meta["scalar_config"] != holdout_config]
@@ -193,11 +209,20 @@ def make_split(
     return result
 
 
-def validate_split(result: SplitResult, meta: pd.DataFrame) -> None:
+def validate_split(
+    result: SplitResult,
+    meta: pd.DataFrame,
+    *,
+    allow_legacy_fingerprint: bool = False,
+    enforce_run_isolation: bool = True,
+) -> None:
     """Validate identity, disjointness, uniqueness, and full row coverage."""
     expected_fingerprint = metadata_fingerprint(meta)
     actual_fingerprint = result.description.get("dataset_fingerprint")
-    if actual_fingerprint != expected_fingerprint:
+    if (
+        actual_fingerprint != expected_fingerprint
+        and not (allow_legacy_fingerprint and actual_fingerprint is None)
+    ):
         raise ValueError(
             "split dataset fingerprint does not match the loaded metadata; "
             "regenerate the split from this Parquet file"
@@ -230,19 +255,7 @@ def validate_split(result: SplitResult, meta: pd.DataFrame) -> None:
             f"split covers {len(covered)} of {len(expected)} metadata rows"
         )
 
-    holdout_config = result.description.get("holdout_config")
-    if holdout_config is not None:
-        test_configs = set(meta.iloc[result.test]["scalar_config"])
-        if test_configs != {holdout_config}:
-            raise ValueError(
-                "holdout test set is contaminated by non-held configurations: "
-                f"{sorted(test_configs - {holdout_config})}"
-            )
-        train_runs = set(meta.iloc[result.train]["run_id"])
-        val_runs = set(meta.iloc[result.val]["run_id"])
-        if train_runs & val_runs:
-            raise ValueError("a physical run appears in both train and validation")
-    else:
+    if enforce_run_isolation:
         run_sets = {
             name: set(meta.iloc[values]["run_id"])
             for name, values in arrays.items()
@@ -258,6 +271,15 @@ def validate_split(result: SplitResult, meta: pd.DataFrame) -> None:
                 f"{sorted(run_overlap)}"
             )
 
+    holdout_config = result.description.get("holdout_config")
+    if holdout_config is not None:
+        test_configs = set(meta.iloc[result.test]["scalar_config"])
+        if test_configs != {holdout_config}:
+            raise ValueError(
+                "holdout test set is contaminated by non-held configurations: "
+                f"{sorted(test_configs - {holdout_config})}"
+            )
+
 
 def save_split(result: SplitResult, path: str) -> None:
     payload = {
@@ -271,7 +293,13 @@ def save_split(result: SplitResult, path: str) -> None:
         json.dump(payload, f, indent=2)
 
 
-def load_split(path: str, meta: Optional[pd.DataFrame] = None) -> SplitResult:
+def load_split(
+    path: str,
+    meta: Optional[pd.DataFrame] = None,
+    *,
+    allow_legacy_fingerprint: bool = False,
+    enforce_run_isolation: bool = True,
+) -> SplitResult:
     with open(path, "r") as f:
         d = json.load(f)
     result = SplitResult(
@@ -281,7 +309,12 @@ def load_split(path: str, meta: Optional[pd.DataFrame] = None) -> SplitResult:
         description=d["description"],
     )
     if meta is not None:
-        validate_split(result, meta)
+        validate_split(
+            result,
+            meta,
+            allow_legacy_fingerprint=allow_legacy_fingerprint,
+            enforce_run_isolation=enforce_run_isolation,
+        )
     return result
 
 

@@ -719,10 +719,11 @@ training code is careful about this: see the \code{log\_cell\_area} buffer in
 \end{caution}
 
 The histogram is converted to 32-bit floats before being yielded, halving its memory
-footprint. At $64\times64$ that is 16~kB per example. The corrected Phase~1 is lossless,
-but the present implementation still buffers one rank's candidates before writing them.
-That choice protects selection correctness at the cost of potentially high memory use;
-large runs must be sized conservatively until rank output is made incremental.
+footprint. At $64\times64$ that is 16~kB per example. The corrected Phase~1 is lossless
+and keeps only one output shard in memory. When the shard reaches
+\code{--hdf5-shard-size} records, it is written and the in-memory lists are cleared.
+The default bound is 25{,}000 histograms per processor; lowering it reduces memory and
+creates more files.
 
 % ===================================================================
 \chapter{Stage 6: Describing the Shape of a Histogram}
@@ -1028,32 +1029,25 @@ idle; they will still write an empty manifest so the merge knows they ran
 
 Every validated window becomes a Phase-1 candidate. The old
 \code{--per-rank-cap-multiplier} option remains only so old command lines do not fail; it no
-longer controls selection. This uses more disk and memory, but makes the global result accurate
+longer controls selection. This uses more disk, but makes the global result accurate
 and independent of how work happened to be divided among processors.
 
 \subsection*{What each processor writes}
 
-\Mpi{893}{write\_rank\_outputs} saves the processor's complete candidate set under
-\code{<output-dir>/\_rank/rank\_NNNN/}, using the same writer as the final dataset
-so the format is identical. Its manifest records the processor number, assigned work units,
-full extraction configuration, a SHA-256 configuration signature, and that extraction was
-lossless.
+\code{StreamingRankWriter} saves the processor's complete candidate set under
+\code{<output-dir>/\_rank/rank\_NNNN/}. It flushes one bounded HDF5 shard and one
+Parquet row group at a time. The manifest is written only after the stream closes; it records
+the processor number, assigned work units, full extraction configuration, a SHA-256
+configuration signature, and that extraction was lossless.
 
 The empty-result branch \MpiL{782} is important: even a processor that retained nothing writes
 a manifest, so that Phase~2 can tell ``ran and found nothing'' apart from ``crashed''.
 
-\subsection*{Freeing memory before the barrier}
+\subsection*{Closing before the barrier}
 
-At \MpiL{1162} the code explicitly deletes its Phase-1 lists before waiting at the barrier:
-
-\begin{center}
-\code{del rank\_selected\_metadata, rank\_selected\_pdfs}
-\end{center}
-
-The comment above it explains why. When many processors share one physical machine, a
-processor that finishes early would otherwise sit idle at the barrier still holding gigabytes
-of histograms, starving its slower neighbours. Releasing the memory first is a courtesy that
-prevents out-of-memory failures late in a run.
+Each processor closes its final HDF5 shard and Parquet writer before waiting at the barrier.
+It therefore reaches the barrier with no rank-wide histogram list in memory. If extraction
+fails, the writer removes its partial files and no manifest commit marker is produced.
 
 \subsection*{The barrier}
 
@@ -1071,10 +1065,14 @@ matches the current command. Stale, partial, extra, or incompatible output stops
 
 \subsection*{Streaming the candidates back in}
 
-\Mpi{1036}{iter\_rank\_candidates} first sorts each rank by the seeded SHA-256 key described
-above. A small heap performs a \term{k-way merge}: it holds only the next candidate from each
-rank and repeatedly takes the smallest key. This produces one global order without loading
-all histograms on rank~0, and that order does not depend on the MPI rank count.
+\code{iter\_rank\_candidates} reads at most \code{--merge-sort-chunk-rows} metadata rows,
+adds the seeded SHA-256 key described above, sorts that bounded chunk, and writes a temporary
+Parquet ``run.'' A small heap then performs a \term{k-way merge}: it holds only the next small
+batch from each run and repeatedly takes the smallest key. Histograms are read only when their
+metadata reaches the front. The \code{--merge-max-open-files} limit (128 by default) prevents
+unbounded file handles while avoiding repeated open/close work on typical runs. This produces
+one global order without loading all metadata or histograms on rank~0, and the order does not
+depend on the MPI rank count. Temporary sort runs are deleted automatically.
 
 It also does some hygiene: it drops the per-rank bookkeeping columns
 (\code{sample\_id}, \code{shard\_id}, \code{local\_index}, \code{hdf5\_file}) which are about
@@ -1761,7 +1759,10 @@ configurations can share the same underlying velocity realization.
         falls back to splitting one run by timestep.
   \item If \code{--holdout-config} names a configuration, that entire configuration becomes the
         test set and everything else is split 80/20 between training and validation. This is
-        specifically a configuration-generalization test.
+        specifically a configuration-generalization test. It is allowed only when the held
+        configuration uses run IDs absent from every other configuration. If run IDs are
+        shared, the program stops: keeping the test set pure, covering every row, and keeping
+        a physical run in one partition cannot all be satisfied at once.
 \end{itemize}
 
 The saved split includes exact indices, run lists, grouping policy, and a SHA-256 fingerprint
@@ -1889,8 +1890,12 @@ After the batches, step the learning-rate schedule and run
 \end{tabular}
 \end{center}
 
-Older run directories predate these checks and do not necessarily contain the new artifacts;
-they should not be treated as validated under the corrected pipeline.
+New manifests declare artifact schema version~2. Older run directories predate these checks
+and should not be treated as validated under the corrected pipeline. They are rejected by
+default. For historical comparison only, \code{evaluate --allow-legacy-artifacts} loads the
+grid stored in their HDF5 file and their older \code{scaler.pkl}; it emits a warning because
+those metrics are not directly comparable with clipped-grid version-2 results. The option is
+explicit because pickle files must only be loaded from a trusted run directory.
 
 \section{Devices}
 
@@ -2097,9 +2102,10 @@ than retyping long paths.
 
 \begin{itemize}
   \item There are only 216 work units, so more than 216 processors buys nothing.
-  \item Phase~1 now keeps every candidate and currently buffers a rank's output before writing.
-        Memory can therefore exceed the old 1--2~GB estimate. Do not oversubscribe a node;
-        monitor memory and divide work among more ranks when necessary.
+  \item Phase~1 keeps every candidate on disk but buffers only one shard per rank. Lower
+        \code{--hdf5-shard-size} to trade more files for less memory. Phase~2 similarly bounds
+        metadata with \code{--merge-sort-chunk-rows}; temporary sorted Parquet files require
+        additional disk space until the merge finishes.
   \item Always pass \code{--keep-rank-outputs} on a long run. Re-running the merge afterwards
         with \code{--skip-phase1} is minutes; re-running Phase~1 is days.
   \item Phase 2 is single-threaded by construction. On the production dataset it took about
@@ -2149,9 +2155,9 @@ NumPy Monte Carlo samples provide independent moment and recovery references. \\
         Dirichlet densities with $\alpha<1$ inside every clipped cell. The implementation instead
         requires $\alpha\geq1$. This is simpler and stable, but cannot represent exact edge or
         corner atoms.
-  \item \textbf{Lossless extraction can use substantial memory.} Candidate loss was more serious
-        than speed, so local pruning was removed first. Per-rank incremental writing remains
-        future engineering work.
+  \item \textbf{Lossless extraction needs temporary disk space.} Local pruning was removed.
+        Incremental shards and external metadata sorting now bound memory, but Phase~1 files
+        plus temporary sort runs must fit on disk.
   \item \textbf{No invented chemistry score.} Test NLL and PDF/moment errors are implemented.
         Reaction-rate error is not, because no chemistry function or table is available here.
   \item \textbf{No silent conversion of old data.} Version-1 histograms may already have lost
